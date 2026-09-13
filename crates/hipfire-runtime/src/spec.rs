@@ -112,6 +112,18 @@ impl SpecStep {
     }
 }
 
+/// Tokens that must be re-forwarded after restoring a speculative window's
+/// pre-verify snapshot. The final consumed token remains pending and is
+/// committed by the caller's ordinary terminal flush.
+pub fn terminal_prefix_replay(window_seed: u32, consumed: &[u32]) -> SmallVec<[u32; 8]> {
+    let mut replay = SmallVec::with_capacity(consumed.len());
+    if !consumed.is_empty() {
+        replay.push(window_seed);
+        replay.extend_from_slice(&consumed[..consumed.len() - 1]);
+    }
+    replay
+}
+
 /// Outcome of the shared greedy accept-prefix rule ([`accept_greedy_prefix`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GreedyAccept {
@@ -763,6 +775,25 @@ pub trait Speculator {
         Ok(false)
     }
 
+    /// Repair a terminal that consumed only a strict prefix of the most recent
+    /// speculative window. Implementations with a retained pre-window snapshot
+    /// restore it and replay only the state-committable prefix, leaving the last
+    /// consumed token pending for the caller's normal terminal flush.
+    ///
+    /// Returns `true` when the resident target and drafter caches are repaired.
+    /// The default is unsupported; callers retain the conservative reset path.
+    fn repair_terminal_prefix(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        window_start: usize,
+        window_seed: u32,
+        consumed: &[u32],
+    ) -> Result<bool, String> {
+        let _ = (gpu, target, window_start, window_seed, consumed);
+        Ok(false)
+    }
+
     /// Rewind drafter-LOCAL state for a fresh conversation. The target's KV /
     /// recurrent state is the daemon's concern (it owns the bundle); this clears
     /// only the drafter's own scratch + checkpoint ring.
@@ -1041,6 +1072,37 @@ pub trait MtpDrafter {
         Ok(false)
     }
 
+    /// Repair a terminal that retained only a strict prefix of the most recent
+    /// MTP window. Implementations with a valid pre-window snapshot restore it
+    /// and replay only the committable prefix.
+    fn mtp_repair_terminal_prefix(
+        &mut self,
+        _gpu: &mut Gpu,
+        _target: &mut dyn SpecTarget,
+        _window_start: usize,
+        _window_seed: u32,
+        _consumed: &[u32],
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    /// Positions of MTP recurrent-state checkpoints available for a divergent
+    /// rendered-history resume.
+    fn mtp_checkpoint_positions(&self) -> Vec<usize> {
+        Vec::new()
+    }
+
+    /// Restore the MTP target's recurrent state to an advertised checkpoint
+    /// and discard checkpoints from the now-stale future.
+    fn mtp_rewind_to(
+        &mut self,
+        _gpu: &mut Gpu,
+        _target: &mut dyn SpecTarget,
+        position: usize,
+    ) -> Result<usize, String> {
+        Ok(position)
+    }
+
     /// Reset drafter-local state for a fresh conversation (MTP cache + any
     /// captured graphs). The target's KV/recurrent reset is the daemon's job.
     /// Returns `Err` when any HIP step required for a clean drafter fails.
@@ -1227,12 +1289,37 @@ impl<A: MtpDrafter> Speculator for MtpSpeculator<A> {
             .mtp_forced_advance(gpu, target, tokens, start_pos, abort)
     }
 
+    fn repair_terminal_prefix(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        window_start: usize,
+        window_seed: u32,
+        consumed: &[u32],
+    ) -> Result<bool, String> {
+        self.arch
+            .mtp_repair_terminal_prefix(gpu, target, window_start, window_seed, consumed)
+    }
+
     fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         self.arch.mtp_reset(gpu)
     }
 
     fn reset_for_realign(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         self.arch.mtp_reset_for_realign(gpu)
+    }
+
+    fn checkpoint_positions(&self) -> Vec<usize> {
+        self.arch.mtp_checkpoint_positions()
+    }
+
+    fn rewind_to(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+    ) -> Result<usize, String> {
+        self.arch.mtp_rewind_to(gpu, target, position)
     }
 
     fn block_size(&self) -> usize {
@@ -1392,10 +1479,14 @@ pub struct SpecEmitCtx<'a> {
     pub eos: u32,
     /// Secondary terminator (e.g. `<|im_end|>`), if the arch uses one.
     pub im_end: Option<u32>,
-    /// Raw tool definitions from the request (OpenAI-shape JSON). Each carrier
-    /// extracts its own grammar `ToolSchema` from these; `None`/empty ⇒ no
-    /// tool-call grammar.
+    /// Raw tool definitions from the request (OpenAI-shape JSON). `Some` enables
+    /// the tool-call *parser* (XML or JSON) even when constrained grammar is off.
+    /// `None` ⇒ tool-looking text is ordinary assistant content.
     pub tools: Option<&'a [serde_json::Value]>,
+    /// Constrained tool-call grammar. Independent of [`Self::tools`]: Qwen3.5/3.8
+    /// XML-native cards keep this false (default `qwen35_grammar_on`) so the
+    /// matcher does not force Hermes-JSON, but still parse `<tool_call>` XML.
+    pub enable_grammar: bool,
     /// User stop sequences matched against the decoded suffix.
     pub stop: Vec<String>,
     /// `max_think_tokens` budget (0 ⇒ no think force-close).
@@ -1828,6 +1919,65 @@ mod tests {
             drafts_generated: 4,
         })
         .is_err());
+    }
+
+    #[test]
+    fn mtp_adapter_exposes_drafter_checkpoint_positions() {
+        struct CheckpointDrafter;
+
+        impl MtpDrafter for CheckpointDrafter {
+            fn mtp_prefill(
+                &mut self,
+                _gpu: &mut Gpu,
+                _target: &mut dyn SpecTarget,
+                _prompt_tokens: &[u32],
+                _fill_tokens: &[u32],
+                _start_pos: usize,
+                _cache_hit: bool,
+                _abort: &dyn Fn() -> bool,
+            ) -> Result<u32, String> {
+                unreachable!()
+            }
+
+            fn mtp_step(
+                &mut self,
+                _gpu: &mut Gpu,
+                _target: &mut dyn SpecTarget,
+                _position: usize,
+                _seed: u32,
+                _emitted: &[u32],
+                _k: usize,
+                _eos: u32,
+                _grammar: Option<&mut dyn SpecGrammar>,
+            ) -> Result<MtpWindow, String> {
+                unreachable!()
+            }
+
+            fn mtp_reset(&mut self, _gpu: &mut Gpu) -> Result<(), String> {
+                Ok(())
+            }
+
+            fn mtp_free(self: Box<Self>, _gpu: &mut Gpu) {}
+
+            fn k(&self) -> usize {
+                4
+            }
+
+            fn ctx_capacity(&self) -> usize {
+                32_768
+            }
+
+            fn requires_greedy(&self) -> bool {
+                true
+            }
+
+            fn mtp_checkpoint_positions(&self) -> Vec<usize> {
+                vec![2_048, 4_096]
+            }
+        }
+
+        let spec = MtpSpeculator::new(CheckpointDrafter);
+        assert_eq!(spec.checkpoint_positions(), vec![2_048, 4_096]);
     }
 
     // ── SpecEmit seam types ─────────────────────────────────────────────────

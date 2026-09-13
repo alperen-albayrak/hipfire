@@ -13,6 +13,8 @@ pub mod config;
 pub mod ep_batch;
 pub mod forward;
 pub mod load;
+#[cfg(feature = "moe-oracle")]
+pub mod oracle;
 pub mod prefill;
 pub mod weights;
 
@@ -22,10 +24,10 @@ pub use batch::{
 };
 pub use config::{
     apply_reap_plan, config_from_hfq, config_from_metadata_json, config_from_safetensors,
-    dense_tp_rank_layouts, local_dense_tp_config, validate_dense_tp, DenseTpRankLayout, LayerType,
-    MaskEmbedOverride, MropeCtx, Qwen35BatchCompatibility, Qwen35BatchLoadConfig,
-    Qwen35BatchParallelism, Qwen35Config, Qwen35EpBatchReceipt, Qwen35EpReduce, Qwen35EpTopology,
-    TreeVerifyCtx,
+    dense_tp_rank_layouts, local_dense_tp_config, validate_dense_tp, DenseTpRankLayout,
+    DflashFusionCtx, LayerType, MaskEmbedOverride, MropeCtx, Qwen35BatchCompatibility,
+    Qwen35BatchLoadConfig, Qwen35BatchParallelism, Qwen35Config, Qwen35EpBatchReceipt,
+    Qwen35EpReduce, Qwen35EpTopology, TreeVerifyCtx,
 };
 pub use ep_batch::{
     forward_ep, forward_prefill_batch_ep, forward_prefill_batch_multi, forward_scratch_multi,
@@ -35,19 +37,20 @@ pub use forward::{
     dump_expert_stats, forward, forward_gpu, forward_prefill_dense_tp, forward_scratch,
     forward_scratch_dense_tp, forward_scratch_embed, forward_scratch_embed_mrope,
     forward_scratch_mrope, forward_scratch_with_hidden, forward_with_embedding,
-    prepare_scratch_inputs, shard_all_moe_layers, shard_moe_experts, Qwen35Scratch,
-    Qwen35ScratchSet,
+    prepare_scratch_inputs, shard_all_moe_layers, shard_all_moe_layers_with_fault,
+    shard_moe_experts, Qwen35Scratch, Qwen35ScratchSet,
 };
 pub use load::{
-    load_weights, load_weights_dense_tp_rank, load_weights_ep_rank, preflight_weights_dense_tp,
-    set_ep_expert_shard, EpShardGuard, HfqSource, Layout, ParoSource,
+    load_weights, load_weights_dense_tp_rank, load_weights_ep_rank,
+    load_weights_ep_rank_with_fault, load_weights_with_fault, preflight_weights_dense_tp, EpFault,
+    EpLoadStage, HfqSource, Layout, ParoSource, StagedLoadFault,
 };
 pub use prefill::{
     forward_prefill_batch, forward_prefill_batch_capped,
     forward_prefill_batch_single_chunk_captured, forward_prefill_batch_single_chunk_captured_opts,
     forward_prefill_batch_with_pbs, forward_prefill_batch_with_pbs_opts,
-    prefill_batch_pbs_eligible, prefill_max_batch, qwen35_layer_batch_admissible,
-    upload_prefill_batch_inputs, PREFILL_MAX_BATCH,
+    prefill_batch_pbs_eligible, prefill_max_batch, prefill_max_batch_ep, prefill_max_batch_tp,
+    qwen35_layer_batch_admissible, upload_prefill_batch_inputs, PREFILL_MAX_BATCH,
 };
 pub(crate) use prefill::{
     moe_ffn_batched_admissible, mq6_batched_admit_enabled_from_env, prefill_moe_ffn_body_batched,

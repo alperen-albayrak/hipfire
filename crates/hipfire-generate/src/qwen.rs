@@ -52,6 +52,18 @@ use hipfire_pflash;
 use hipfire_runtime::prompt_frame;
 use rdna_compute;
 
+/// Keep host/token publication behind a successful device mutation.
+///
+/// The PP decode/close/nudge/trailer paths all write recurrent/KV state before
+/// exposing their synthetic token. Keeping this sequencing in one inline gate
+/// makes the no-failure-publication contract explicit and testable without HIP.
+#[inline]
+fn publish_after_forward<E>(forward: Result<(), E>, publish: impl FnOnce()) -> Result<(), E> {
+    forward?;
+    publish();
+    Ok(())
+}
+
 /// Expert-parallel streaming generate (task #26, ds4 first). Greedy AR via
 /// `forward_ep` across the EP ranks; logits gathered on rank 0 and sampled on
 /// the host. v1: greedy + basic token streaming (no grammar / tool-calls /
@@ -69,6 +81,33 @@ pub struct EpSampling {
     pub top_p: f32,
     pub top_k: Option<u32>,
     pub min_p: Option<f32>,
+}
+
+/// Which EP serve body owns a loaded EP model. Pure so the dispatch contract
+/// is unit-testable. Archs without an `EpArch` (LFM2, Cohere2, anything new)
+/// must NOT reach a serve body: the old `_ => ep_serve_ds4` fallthrough ran
+/// the DeepSeek4 EP protocol against foreign weights instead of refusing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpServeTarget {
+    Minimax,
+    Qwen35Moe,
+    Qwen35DenseTp,
+    Deepseek4,
+    UnsupportedArch(u32),
+}
+
+/// EP serve dispatch by arch_id: the arch-level default. 5|6 default to the
+/// MoE server; a dense-TP load (`EpArch::Qwen35DenseTp`) is refined to its own
+/// server by the `EpArch` match in [`generate_ep`] — arch_id alone cannot
+/// distinguish them, and a MoE model must never enter the dense-TP server.
+/// Anything else is an explicit refusal, never a wrong-server fallthrough.
+pub fn ep_serve_target(arch_id: u32) -> EpServeTarget {
+    match arch_id {
+        10 => EpServeTarget::Minimax,
+        5 | 6 => EpServeTarget::Qwen35Moe,
+        9 => EpServeTarget::Deepseek4,
+        other => EpServeTarget::UnsupportedArch(other),
+    }
 }
 
 pub fn generate_ep(
@@ -225,8 +264,20 @@ pub fn generate_ep(
         hipfire_loader::EpEosRoute::Qwen35 => m.qwen35_eos_tok,
         hipfire_loader::EpEosRoute::Deepseek4 => m.deepseek4_eos_tok,
     };
-    match m.arch_id {
-        10 => ep_serve_minimax(
+    // Route by the loaded `EpArch`, never by arch_id alone: arch 5|6 covers
+    // both the MoE server (`EpArch::Qwen35`) and the dense-TP server
+    // (`EpArch::Qwen35DenseTp`), and a MoE model must never enter the
+    // dense-TP server (nor vice versa). `ep_serve_target` above is the
+    // arch-level default used when no EP state is loaded.
+    let serve_target = match m.ep.as_ref().map(|ep| &ep.inner) {
+        Some(EpArch::Minimax { .. }) => EpServeTarget::Minimax,
+        Some(EpArch::Qwen35 { .. }) => EpServeTarget::Qwen35Moe,
+        Some(EpArch::Qwen35DenseTp { .. }) => EpServeTarget::Qwen35DenseTp,
+        Some(EpArch::Ds4 { .. }) => EpServeTarget::Deepseek4,
+        None => ep_serve_target(m.arch_id),
+    };
+    match serve_target {
+        EpServeTarget::Minimax => ep_serve_minimax(
             m,
             stdout,
             id,
@@ -237,7 +288,7 @@ pub fn generate_ep(
             primed_think,
             sampling,
         ),
-        5 | 6 => ep_serve_qwen35_dense_tp(
+        EpServeTarget::Qwen35Moe => ep_serve_qwen35_moe(
             m,
             stdout,
             id,
@@ -249,7 +300,19 @@ pub fn generate_ep(
             primed_think,
             sampling,
         ),
-        _ => ep_serve_ds4(
+        EpServeTarget::Qwen35DenseTp => ep_serve_qwen35_dense_tp(
+            m,
+            stdout,
+            id,
+            &prompt_ids,
+            eos_tok,
+            max_tokens,
+            max_think_tokens,
+            stop,
+            primed_think,
+            sampling,
+        ),
+        EpServeTarget::Deepseek4 => ep_serve_ds4(
             m,
             stdout,
             id,
@@ -261,6 +324,26 @@ pub fn generate_ep(
             stop,
             sampling,
         ),
+        EpServeTarget::UnsupportedArch(arch) => {
+            // Fail closed: no EpArch exists for this arch_id (LFM2, Cohere2,
+            // anything new), so there is no correct server to call. Name the
+            // arch rather than running another arch's EP protocol against
+            // foreign weights.
+            emit_active_attempt_error(
+                stdout,
+                Some(id),
+                &format!(
+                    "EP generate not supported for arch_id={arch} \
+                     (only 9/DeepSeek4, 10/MiniMax and 5|6 Qwen3.5 \
+                     have an EP serve path)"
+                ),
+                "unsupported",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            return;
+        }
     }
 }
 
@@ -317,57 +400,87 @@ pub fn ep_serve_qwen35_dense_tp(
     }
 
     // This route replays the complete rendered conversation each request.
-    if let Some(EpState { gpus, inner }) = m.ep.as_mut() {
-        if let EpArch::Qwen35DenseTp { dn_states, .. } = inner {
-            for (rank, state) in dn_states.iter_mut().enumerate() {
-                let gpu = &mut gpus.devices[rank];
-                if let Err(e) = gpu.bind_thread() {
-                    emit_active_attempt_error(
-                        stdout,
-                        Some(id),
-                        &format!("dense TP bind_thread rank {rank}: {e:?}"),
-                        "validation",
-                        false,
-                        false,
-                    );
-                    let _ = stdout.flush();
-                    return;
+    // Any pre-request reset failure is terminal too: the EP epilogue below
+    // re-runs the reset and attests every rank before exposing the error.
+    let reset_error = {
+        let mut error = None;
+        if let Some(EpState { gpus, inner }) = m.ep.as_mut() {
+            if let EpArch::Qwen35DenseTp { dn_states, .. } = inner {
+                for (rank, state) in dn_states.iter_mut().enumerate() {
+                    let gpu = &mut gpus.devices[rank];
+                    if let Err(e) = gpu.bind_thread() {
+                        error = Some(format!("dense TP bind_thread rank {rank}: {e:?}"));
+                        break;
+                    }
+                    if let Err(e) = state.reset(gpu) {
+                        error = Some(format!("dense TP state reset rank {rank}: {e:?}"));
+                        break;
+                    }
+                    gpu.invalidate_graph_state();
                 }
-                if let Err(e) = state.reset(gpu) {
-                    emit_active_attempt_error(
-                        stdout,
-                        Some(id),
-                        &format!("dense TP state reset rank {rank}: {e:?}"),
-                        "validation",
-                        false,
-                        false,
-                    );
-                    let _ = stdout.flush();
-                    return;
-                }
-                gpu.invalidate_graph_state();
             }
         }
+        error
+    };
+    if let Some(error) = reset_error {
+        dense_tp_fail_closed_error(m, stdout, id, &error, "validation", false);
+        let _ = stdout.flush();
+        return;
     }
     m.seq_pos = 0;
     m.conversation_tokens.clear();
     // `primed_think` preserves Jinja enable_thinking semantics (render ended on
     // an open `<think>` primer). Tool requests fail closed before this route.
-    emit_gen_start(
+    crate::ar::emit_generation_start(
+        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::QwenAr),
         stdout,
         id,
         primed_think,
-        gen_start_contract_version_for_arch(m.arch_id),
     );
 
     let t_prefill = Instant::now();
-    for (chunk_index, chunk) in prompt_ids.chunks(32).enumerate() {
+    // Chunk at the rank's prefill batch, not a fixed 32: M=32 misses the MMQ
+    // batch floor (128) and fires the per-layer collectives 16x more often
+    // than the chunk the TP prefill re-chunks to internally (8k prompt on
+    // 2x gfx1100: 72.1 -> 54.7 s wall).
+    let tp_prefill_chunk = match m.ep.as_ref() {
+        Some(EpState { gpus, .. }) => {
+            qwen35::prefill_max_batch_tp(&gpus.devices[0], gpus.devices.len()).max(1)
+        }
+        None => {
+            dense_tp_fail_closed_error(
+                m,
+                stdout,
+                id,
+                "dense TP serve without EP state",
+                "validation",
+                false,
+            );
+            let _ = stdout.flush();
+            return;
+        }
+    };
+    for (chunk_index, chunk) in prompt_ids.chunks(tp_prefill_chunk).enumerate() {
         if check_abort(id) {
-            ep_emit_abort(stdout, id, m, 0);
+            ep_emit_abort(
+                crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::QwenAr),
+                stdout,
+                id,
+                m,
+                0,
+            );
             return;
         }
         let result = {
             let Some(EpState { gpus, inner }) = m.ep.as_mut() else {
+                dense_tp_fail_closed_error(
+                    m,
+                    stdout,
+                    id,
+                    "dense TP prefill without EP state",
+                    "validation",
+                    false,
+                );
                 return;
             };
             let EpArch::Qwen35DenseTp {
@@ -379,12 +492,12 @@ pub fn ep_serve_qwen35_dense_tp(
                 scratches,
             } = inner
             else {
-                emit_active_attempt_error(
+                dense_tp_fail_closed_error(
+                    m,
                     stdout,
-                    Some(id),
+                    id,
                     "EP arch mismatch (expected dense Qwen TP)",
                     "validation",
-                    false,
                     false,
                 );
                 return;
@@ -395,19 +508,19 @@ pub fn ep_serve_qwen35_dense_tp(
                 weights,
                 configs,
                 chunk,
-                chunk_index * 32,
+                chunk_index * tp_prefill_chunk,
                 kv_caches,
                 dn_states,
                 scratches,
             )
         };
         if let Err(e) = result {
-            emit_active_attempt_error(
+            dense_tp_fail_closed_error(
+                m,
                 stdout,
-                Some(id),
+                id,
                 &format!("dense TP prefill: {e:?}"),
                 "validation",
-                false,
                 false,
             );
             let _ = stdout.flush();
@@ -419,38 +532,26 @@ pub fn ep_serve_qwen35_dense_tp(
     m.conversation_tokens.extend_from_slice(prompt_ids);
     m.seq_pos = prompt_n;
     let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
-    let mut logits = {
+    let logits_result: Result<Vec<f32>, String> = (|| {
         let Some(EpState { gpus, inner }) = m.ep.as_mut() else {
-            return;
+            return Err("dense TP first-logits without EP state".to_string());
         };
         let EpArch::Qwen35DenseTp { scratches, .. } = inner else {
-            return;
+            return Err("EP arch mismatch (expected dense Qwen TP)".to_string());
         };
         if let Err(e) = gpus.devices[0].bind_thread() {
-            emit_active_attempt_error(
-                stdout,
-                Some(id),
-                &format!("dense TP first-logits bind_thread: {e:?}"),
-                "validation",
-                false,
-                false,
-            );
+            return Err(format!("dense TP first-logits bind_thread: {e:?}"));
+        }
+        gpus.devices[0]
+            .download_f32(&scratches[0].logits)
+            .map_err(|e| format!("dense TP first-logits download: {e:?}"))
+    })();
+    let mut logits = match logits_result {
+        Ok(logits) => logits,
+        Err(message) => {
+            dense_tp_fail_closed_error(m, stdout, id, &message, "validation", false);
             let _ = stdout.flush();
             return;
-        }
-        match gpus.devices[0].download_f32(&scratches[0].logits) {
-            Ok(v) => v,
-            Err(e) => {
-                emit_active_attempt_error(
-                    stdout,
-                    Some(id),
-                    &format!("dense TP first-logits download: {e:?}"),
-                    "validation",
-                    false,
-                    false,
-                );
-                return;
-            }
         }
     };
 
@@ -464,7 +565,13 @@ pub fn ep_serve_qwen35_dense_tp(
     let mut hit_custom_stop = false;
     while generated < max_tokens {
         if check_abort(id) {
-            ep_emit_abort(stdout, id, m, generated);
+            ep_emit_abort(
+                crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::QwenAr),
+                stdout,
+                id,
+                m,
+                generated,
+            );
             return;
         }
         let next = llama::sample_full_dist(
@@ -477,9 +584,9 @@ pub fn ep_serve_qwen35_dense_tp(
 
         // KV write before any client-visible classify/emit (same contract as AR).
         let write_pos = m.seq_pos;
-        let forward = {
+        let forward_result: Result<(), String> = (|| {
             let Some(EpState { gpus, inner }) = m.ep.as_mut() else {
-                return;
+                return Err("dense TP decode without EP state".to_string());
             };
             let EpArch::Qwen35DenseTp {
                 shard,
@@ -490,21 +597,15 @@ pub fn ep_serve_qwen35_dense_tp(
                 scratches,
             } = inner
             else {
-                return;
+                return Err("EP arch mismatch (expected dense Qwen TP)".to_string());
             };
             qwen35::forward_scratch_dense_tp(
                 gpus, shard, weights, configs, next, write_pos, kv_caches, dn_states, scratches,
             )
-        };
-        if let Err(e) = forward {
-            emit_active_attempt_error(
-                stdout,
-                Some(id),
-                &format!("dense TP decode: {e:?}"),
-                "validation",
-                false,
-                false,
-            );
+            .map_err(|e| format!("dense TP decode: {e:?}"))
+        })();
+        if let Err(message) = forward_result {
+            dense_tp_fail_closed_error(m, stdout, id, &message, "validation", false);
             return;
         }
 
@@ -532,15 +633,14 @@ pub fn ep_serve_qwen35_dense_tp(
         ) {
             Ok(stop) => stop,
             Err(err) => {
-                emit_active_attempt_error(
+                dense_tp_fail_closed_error(
+                    m,
                     stdout,
-                    Some(id),
+                    id,
                     &format!("dense TP semantic classify: {err}"),
                     "validation",
                     false,
-                    false,
                 );
-                let _ = stdout.flush();
                 return;
             }
         };
@@ -583,38 +683,25 @@ pub fn ep_serve_qwen35_dense_tp(
             break;
         }
 
-        logits = {
+        let logits_result: Result<Vec<f32>, String> = (|| {
             let Some(EpState { gpus, inner }) = m.ep.as_mut() else {
-                return;
+                return Err("dense TP decode logits without EP state".to_string());
             };
             let EpArch::Qwen35DenseTp { scratches, .. } = inner else {
-                return;
+                return Err("EP arch mismatch (expected dense Qwen TP)".to_string());
             };
             if let Err(e) = gpus.devices[0].bind_thread() {
-                emit_active_attempt_error(
-                    stdout,
-                    Some(id),
-                    &format!("dense TP decode logits bind_thread: {e:?}"),
-                    "validation",
-                    false,
-                    false,
-                );
-                let _ = stdout.flush();
-                return;
+                return Err(format!("dense TP decode logits bind_thread: {e:?}"));
             }
-            match gpus.devices[0].download_f32(&scratches[0].logits) {
-                Ok(v) => v,
-                Err(e) => {
-                    emit_active_attempt_error(
-                        stdout,
-                        Some(id),
-                        &format!("dense TP decode logits download: {e:?}"),
-                        "validation",
-                        false,
-                        false,
-                    );
-                    return;
-                }
+            gpus.devices[0]
+                .download_f32(&scratches[0].logits)
+                .map_err(|e| format!("dense TP decode logits download: {e:?}"))
+        })();
+        logits = match logits_result {
+            Ok(logits) => logits,
+            Err(message) => {
+                dense_tp_fail_closed_error(m, stdout, id, &message, "validation", false);
+                return;
             }
         };
     }
@@ -624,15 +711,14 @@ pub fn ep_serve_qwen35_dense_tp(
     let (finish, _visible) = match semantic.finish(stdout, hit_length_cap) {
         Ok(pair) => pair,
         Err(err) => {
-            emit_active_attempt_error(
+            dense_tp_fail_closed_error(
+                m,
                 stdout,
-                Some(id),
+                id,
                 &format!("dense TP semantic finish: {err}"),
                 "validation",
                 false,
-                false,
             );
-            let _ = stdout.flush();
             return;
         }
     };
@@ -647,6 +733,483 @@ pub fn ep_serve_qwen35_dense_tp(
         _ => "stop",
     };
     ep_emit_done(
+        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::QwenAr),
+        stdout,
+        id,
+        m,
+        generated,
+        prompt_n,
+        prefill_ms,
+        t_decode.elapsed().as_secs_f64() * 1000.0,
+        finish_reason,
+    );
+}
+
+/// Reset MoE-EP sequential state on every rank before publishing one
+/// fail-closed error. Same attested all-rank epilogue as the dense-TP path
+/// (via the shared mesh reset, which owns `ep_reset_after_abort`), without
+/// requiring a separate daemon GPU handle.
+fn qwen35_moe_fail_closed_error(
+    m: &mut LoadedModel,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    message: &str,
+    class: &str,
+    retryable: bool,
+) {
+    let ep = crate::common::reset_mesh_request_state(m, None);
+    emit_fail_closed_error(stdout, Some(id), message, class, retryable, &ep);
+}
+
+/// Qwen3.5-MoE sequential expert-parallel serving loop (tp=2|4).
+///
+/// Greedy/sampled AR via the canonical `qwen35::forward_ep` across the EP
+/// ranks (per-token prefill replayed from position 0 every turn, exactly as
+/// the ds4 EP server does); logits gathered on rank 0 and sampled host-side
+/// with the request-resolved `EpSampling`. Qwen contract-v2 semantic
+/// streaming matches the dense-TP server, so think/stop/EOS handling is
+/// identical and only the forward + state types differ.
+#[allow(clippy::too_many_arguments)]
+pub fn ep_serve_qwen35_moe(
+    m: &mut LoadedModel,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt_ids: &[u32],
+    eos_tok: u32,
+    max_tokens: usize,
+    max_think_tokens: usize,
+    stop: &[String],
+    primed_think: bool,
+    sampling: EpSampling,
+) {
+    let prompt_n = prompt_ids.len();
+    if prompt_n.saturating_add(max_tokens) > m.physical_cap {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            &format!(
+                "prompt exceeds context capacity: prompt={prompt_n} + max_tokens={max_tokens} > capacity={}",
+                m.physical_cap
+            ),
+            "context_length",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
+
+    // This route replays the complete rendered conversation each request, so
+    // no per-rank state is reusable across turns: reset DeltaNet + clear KV
+    // on every rank (on its own device) before prefill. Any pre-request
+    // reset failure is terminal via the attested EP epilogue below.
+    let reset_error = {
+        let mut error = None;
+        if let Some(EpState { gpus, inner }) = m.ep.as_mut() {
+            if let EpArch::Qwen35 {
+                kv_caches,
+                dn_states,
+                ..
+            } = inner
+            {
+                let rank_count = gpus.devices.len();
+                if kv_caches.len() != rank_count || dn_states.len() != rank_count {
+                    error = Some(format!(
+                        "qwen35 MoE EP state rank mismatch: kv={} dn={} ranks={rank_count}",
+                        kv_caches.len(),
+                        dn_states.len()
+                    ));
+                } else {
+                    for rank in 0..rank_count {
+                        let gpu = &mut gpus.devices[rank];
+                        if let Err(e) = gpu.bind_thread() {
+                            error = Some(format!("qwen35 MoE EP bind_thread rank {rank}: {e:?}"));
+                            break;
+                        }
+                        if let Err(e) = dn_states[rank].reset(gpu) {
+                            error = Some(format!("qwen35 MoE EP state reset rank {rank}: {e:?}"));
+                            break;
+                        }
+                        if let Err(e) = kv_caches[rank].clear_gpu(gpu) {
+                            error = Some(format!("qwen35 MoE EP KV clear rank {rank}: {e:?}"));
+                            break;
+                        }
+                        gpu.invalidate_graph_state();
+                    }
+                }
+            }
+        }
+        error
+    };
+    if let Some(error) = reset_error {
+        qwen35_moe_fail_closed_error(m, stdout, id, &error, "validation", false);
+        let _ = stdout.flush();
+        return;
+    }
+    m.seq_pos = 0;
+    m.conversation_tokens.clear();
+    // `primed_think` preserves Jinja enable_thinking semantics (render ended on
+    // an open `<think>` primer). Tool requests fail closed before this route.
+    crate::ar::emit_generation_start(
+        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::QwenAr),
+        stdout,
+        id,
+        primed_think,
+    );
+
+    let t_prefill = Instant::now();
+    let mut aborted_in_prefill = false;
+    // Batched EP prefill: windows of <= common prefill scratch max_batch.
+    // Absolute start_pos is the chunk offset (request already reset KV/DN above).
+    // Scratch source: load-owned prefill_pbs/prefill_partials when batch is
+    // None; when batch is staged the loader drains those and sequential
+    // fallthrough (daemon !ep_batch_eligible) reuses batch seed scratch via
+    // sequential_prefill_scratch_mut. Missing/empty scratch fails closed
+    // before GPU mutation. No token fallback.
+    let mut off = 0usize;
+    while off < prompt_n {
+        if check_abort(id) {
+            aborted_in_prefill = true;
+            break;
+        }
+        let result = {
+            let Some(EpState { gpus, inner }) = m.ep.as_mut() else {
+                qwen35_moe_fail_closed_error(
+                    m,
+                    stdout,
+                    id,
+                    "qwen35 MoE EP prefill without EP state",
+                    "validation",
+                    false,
+                );
+                return;
+            };
+            let EpArch::Qwen35 {
+                config,
+                weights,
+                kv_caches,
+                dn_states,
+                scratches,
+                batch,
+                prefill_pbs,
+                prefill_partials,
+                ..
+            } = inner
+            else {
+                qwen35_moe_fail_closed_error(
+                    m,
+                    stdout,
+                    id,
+                    "EP arch mismatch (expected qwen35 MoE EP)",
+                    "validation",
+                    false,
+                );
+                return;
+            };
+            let n_rank = gpus.devices.len();
+            // Select prefill scratch once per window: seed when batch staged,
+            // else load-owned sequential buffers.
+            if let Some(batch_state) = batch.as_mut() {
+                // Disjoint borrow from the concrete batch owner: seed scratch plus
+                // the SAME live lease `prefill_lane`/`forward_tick` reduce under,
+                // so the MoE partial sum uses the leased rooted API the lease
+                // guard requires. No new pool, no re-acquire, no release.
+                let (pbs, parts, peer_lease) = batch_state.sequential_prefill_scratch_mut();
+                if pbs.is_empty()
+                    || parts.is_empty()
+                    || pbs.len() != n_rank
+                    || parts.len() != n_rank
+                {
+                    Err("qwen35 MoE EP prefill missing batch seed scratch".to_string())
+                } else {
+                    let max_batch = pbs[0].max_batch;
+                    if max_batch == 0 {
+                        Err("qwen35 MoE EP prefill seed max_batch is zero".to_string())
+                    } else {
+                        let end = (off + max_batch).min(prompt_n);
+                        let start_pos = off;
+                        qwen35::forward_prefill_batch_ep(
+                            gpus,
+                            weights,
+                            config,
+                            &prompt_ids[start_pos..end],
+                            start_pos,
+                            kv_caches,
+                            dn_states,
+                            scratches,
+                            pbs,
+                            parts,
+                            peer_lease,
+                        )
+                        .map(|_| end)
+                        .map_err(|e| format!("qwen35 MoE EP prefill: {e:?}"))
+                    }
+                }
+            } else if prefill_pbs.is_empty()
+                || prefill_partials.is_empty()
+                || prefill_pbs.len() != n_rank
+                || prefill_partials.len() != n_rank
+            {
+                Err("qwen35 MoE EP prefill missing load-owned prefill scratch".to_string())
+            } else {
+                let max_batch = prefill_pbs[0].max_batch;
+                if max_batch == 0 {
+                    Err("qwen35 MoE EP prefill scratch max_batch is zero".to_string())
+                } else {
+                    let end = (off + max_batch).min(prompt_n);
+                    let start_pos = off;
+                    // Plain sequential without batch: no live lease, so the
+                    // unleased selection inside is unchanged.
+                    qwen35::forward_prefill_batch_ep(
+                        gpus,
+                        weights,
+                        config,
+                        &prompt_ids[start_pos..end],
+                        start_pos,
+                        kv_caches,
+                        dn_states,
+                        scratches,
+                        prefill_pbs,
+                        prefill_partials,
+                        None,
+                    )
+                    .map(|_| end)
+                    .map_err(|e| format!("qwen35 MoE EP prefill: {e:?}"))
+                }
+            }
+        };
+        match result {
+            Ok(end) => off = end,
+            Err(message) => {
+                qwen35_moe_fail_closed_error(m, stdout, id, &message, "validation", false);
+                let _ = stdout.flush();
+                return;
+            }
+        }
+    }
+    if aborted_in_prefill || check_abort(id) {
+        ep_emit_abort(
+            crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::QwenAr),
+            stdout,
+            id,
+            m,
+            0,
+        );
+        return;
+    }
+    // Bookkeeping matches the fully replayed prompt so decode commits extend
+    // the same conversation/stream positions the single-GPU path would.
+    m.conversation_tokens.extend_from_slice(prompt_ids);
+    m.seq_pos = prompt_n;
+    let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
+    let logits_result: Result<Vec<f32>, String> = (|| {
+        let Some(EpState { gpus, inner }) = m.ep.as_mut() else {
+            return Err("qwen35 MoE EP first-logits without EP state".to_string());
+        };
+        let EpArch::Qwen35 { scratches, .. } = inner else {
+            return Err("EP arch mismatch (expected qwen35 MoE EP)".to_string());
+        };
+        if let Err(e) = gpus.devices[0].bind_thread() {
+            return Err(format!("qwen35 MoE EP first-logits bind_thread: {e:?}"));
+        }
+        gpus.devices[0]
+            .download_f32(&scratches[0].logits)
+            .map_err(|e| format!("qwen35 MoE EP first-logits download: {e:?}"))
+    })();
+    let mut logits = match logits_result {
+        Ok(logits) => logits,
+        Err(message) => {
+            qwen35_moe_fail_closed_error(m, stdout, id, &message, "validation", false);
+            let _ = stdout.flush();
+            return;
+        }
+    };
+
+    let t_decode = Instant::now();
+    let mut semantic =
+        crate::ar::QwenArSemanticProducer::new_with_tool_protocol(id, primed_think, false);
+    let mut streamed_tokens: Vec<u32> = Vec::new();
+    let mut bytes_fed_to_filter = 0usize;
+    let mut generated = 0usize;
+    let mut think_count = 0usize;
+    let mut hit_custom_stop = false;
+    while generated < max_tokens {
+        if check_abort(id) {
+            ep_emit_abort(
+                crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::QwenAr),
+                stdout,
+                id,
+                m,
+                generated,
+            );
+            return;
+        }
+        let next = llama::sample_full_dist(
+            &logits,
+            sampling.temp,
+            sampling.top_p,
+            sampling.top_k,
+            sampling.min_p,
+        );
+
+        // KV write before any client-visible classify/emit (same contract as AR).
+        let write_pos = m.seq_pos;
+        let forward_result: Result<(), String> = (|| {
+            let Some(EpState { gpus, inner }) = m.ep.as_mut() else {
+                return Err("qwen35 MoE EP decode without EP state".to_string());
+            };
+            let EpArch::Qwen35 {
+                config,
+                weights,
+                kv_caches,
+                dn_states,
+                scratches,
+                partials,
+                batch,
+                ..
+            } = inner
+            else {
+                return Err("EP arch mismatch (expected qwen35 MoE EP)".to_string());
+            };
+            // Batch-staged sequential fallback borrows the SAME live lease the
+            // batch owner reduces under; ordinary sequential keeps None.
+            let peer_lease = batch.as_ref().and_then(|b| b.peer_reduce_lease());
+            qwen35::forward_ep(
+                gpus, weights, config, next, write_pos, kv_caches, dn_states, scratches, partials,
+                peer_lease,
+            )
+            .map_err(|e| format!("qwen35 MoE EP decode: {e:?}"))
+        })();
+        if let Err(message) = forward_result {
+            qwen35_moe_fail_closed_error(m, stdout, id, &message, "validation", false);
+            return;
+        }
+
+        let prev_fed = bytes_fed_to_filter;
+        let elapsed_ms = t_decode.elapsed().as_millis() as u64;
+        let filter_stop = match semantic.commit_and_classify(
+            stdout,
+            next,
+            || {
+                let pos = crate::ar::qwen_ar_raw_commit_token(
+                    &mut m.conversation_tokens,
+                    &mut streamed_tokens,
+                    &mut m.seq_pos,
+                    next,
+                    crate::ar::QwenArRawCommitDisposition::ClassifiedVisible,
+                );
+                let all_bytes = m.tokenizer.as_ref().unwrap().decode_bytes(&streamed_tokens);
+                let new_bytes = all_bytes[prev_fed.min(all_bytes.len())..].to_vec();
+                bytes_fed_to_filter = all_bytes.len();
+                (pos, new_bytes)
+            },
+            |pos, out| {
+                emit_committed_event(out, id, next, pos, elapsed_ms);
+            },
+        ) {
+            Ok(stop) => stop,
+            Err(err) => {
+                qwen35_moe_fail_closed_error(
+                    m,
+                    stdout,
+                    id,
+                    &format!("qwen35 MoE EP semantic classify: {err}"),
+                    "validation",
+                    false,
+                );
+                return;
+            }
+        };
+        generated += 1;
+
+        // Custom stops match visible answer text (post EosFilter/think route),
+        // never raw protocol bytes.
+        if stop
+            .iter()
+            .any(|s| !s.is_empty() && semantic.visible().ends_with(s.as_str()))
+        {
+            hit_custom_stop = true;
+            break;
+        }
+
+        // Conservative think-budget: count tokens while the router is inside a
+        // think span. Exceeding a nonzero cap fails closed — no force-close
+        // splice and no partial semantic done.
+        if max_think_tokens > 0 {
+            if semantic.think_router.in_think() {
+                think_count = think_count.saturating_add(1);
+                if think_count >= max_think_tokens {
+                    let ep = ep_reset_after_abort(m);
+                    emit_fail_closed_error(
+                        stdout,
+                        Some(id),
+                        "think token budget exceeded (validation)",
+                        "validation",
+                        false,
+                        &ep,
+                    );
+                    return;
+                }
+            } else {
+                think_count = 0;
+            }
+        }
+
+        if filter_stop || next == eos_tok || generated >= max_tokens {
+            break;
+        }
+
+        let logits_result: Result<Vec<f32>, String> = (|| {
+            let Some(EpState { gpus, inner }) = m.ep.as_mut() else {
+                return Err("qwen35 MoE EP decode logits without EP state".to_string());
+            };
+            let EpArch::Qwen35 { scratches, .. } = inner else {
+                return Err("EP arch mismatch (expected qwen35 MoE EP)".to_string());
+            };
+            if let Err(e) = gpus.devices[0].bind_thread() {
+                return Err(format!("qwen35 MoE EP decode logits bind_thread: {e:?}"));
+            }
+            gpus.devices[0]
+                .download_f32(&scratches[0].logits)
+                .map_err(|e| format!("qwen35 MoE EP decode logits download: {e:?}"))
+        })();
+        logits = match logits_result {
+            Ok(logits) => logits,
+            Err(message) => {
+                qwen35_moe_fail_closed_error(m, stdout, id, &message, "validation", false);
+                return;
+            }
+        };
+    }
+
+    // Custom stop is a natural/filter-class terminal, not length.
+    let hit_length_cap = generated >= max_tokens && !hit_custom_stop;
+    let (finish, _visible) = match semantic.finish(stdout, hit_length_cap) {
+        Ok(pair) => pair,
+        Err(err) => {
+            qwen35_moe_fail_closed_error(
+                m,
+                stdout,
+                id,
+                &format!("qwen35 MoE EP semantic finish: {err}"),
+                "validation",
+                false,
+            );
+            return;
+        }
+    };
+    if matches!(finish.cause, crate::ar::QwenArTerminalCause::OpenThink) {
+        let ep = ep_reset_after_abort(m);
+        crate::ar::emit_qwen_ar_open_think_terminal(stdout, id, generated, &ep);
+        return;
+    }
+    let finish_reason = match finish.finish_reason {
+        "length" => "length",
+        "error" => "error",
+        _ => "stop",
+    };
+    ep_emit_done(
+        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::QwenAr),
         stdout,
         id,
         m,
@@ -659,6 +1222,7 @@ pub fn ep_serve_qwen35_dense_tp(
 }
 
 pub fn ep_emit_done(
+    route: crate::ar::GenerationRoute,
     stdout: &mut std::io::Stdout,
     id: &str,
     m: &mut LoadedModel,
@@ -703,14 +1267,16 @@ pub fn ep_emit_done(
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
-        ClientTerminalDecision::Abort => ep_emit_abort(stdout, id, m, generated),
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_generation_done_value(route, stdout, &pending_done);
+        }
+        ClientTerminalDecision::Abort => ep_emit_abort(route, stdout, id, m, generated),
     }
 }
 
-/// Full EP route-complete abort reset: per-rank bind + cursor reset + decode
+/// Full EP route-complete abort reset: per-rank bind + cursor reset + KV/DeltaNet
 /// cache zero + graph invalidate, then device_synchronize on every rank.
-/// `rolled_back` is true only when every bind/reset and synchronize succeeds.
+/// `rolled_back` is true only when every bind/reset/clear and synchronize succeeds.
 pub fn ep_reset_after_abort(m: &mut LoadedModel) -> RollbackEpilogue {
     let mut first_err: Option<String> = None;
     if let Some(ep) = m.ep.as_mut() {
@@ -737,18 +1303,99 @@ pub fn ep_reset_after_abort(m: &mut LoadedModel) -> RollbackEpilogue {
                     g.invalidate_graph_state();
                 }
             }
-            EpArch::Qwen35 { batch, .. } => {
+            EpArch::Qwen35 {
+                kv_caches,
+                dn_states,
+                batch,
+                ..
+            } => {
                 if let Some(batch) = batch.as_mut() {
                     if let Err(e) = batch.reset_all(gpus) {
                         push_reset_err(&mut first_err, "qwen35 ep batch reset_all", e);
                     }
                 }
-                for dev in &mut gpus.devices {
-                    dev.invalidate_graph_state();
+                // Sequential per-rank decode state: reset DeltaNet + clear KV
+                // on each owning device so the next request replays from a
+                // cold cursor (cancel/reuse correctness). Mirrors the dense-TP
+                // arm with the MoE-EP field names.
+                let rank_count = gpus.devices.len();
+                if dn_states.len() != rank_count {
+                    push_reset_err(
+                        &mut first_err,
+                        "qwen35 MoE EP DN state rank count",
+                        format!("got {}, expected {rank_count}", dn_states.len()),
+                    );
+                }
+                if kv_caches.len() != rank_count {
+                    push_reset_err(
+                        &mut first_err,
+                        "qwen35 MoE EP KV cache rank count",
+                        format!("got {}, expected {rank_count}", kv_caches.len()),
+                    );
+                }
+                for rank in 0..rank_count {
+                    let gpu = &mut gpus.devices[rank];
+                    if let Err(e) = gpu.bind_thread() {
+                        push_reset_err(
+                            &mut first_err,
+                            &format!("qwen35 MoE EP rank{rank} bind_thread"),
+                            e,
+                        );
+                    }
+                    if let Some(state) = dn_states.get_mut(rank) {
+                        if let Err(e) = state.reset(gpu) {
+                            push_reset_err(
+                                &mut first_err,
+                                &format!("qwen35 MoE EP rank{rank} state reset"),
+                                e,
+                            );
+                        }
+                    } else {
+                        push_reset_err(
+                            &mut first_err,
+                            &format!("qwen35 MoE EP rank{rank} state"),
+                            "missing",
+                        );
+                    }
+                    if let Some(kv) = kv_caches.get_mut(rank) {
+                        if let Err(e) = kv.clear_gpu(gpu) {
+                            push_reset_err(
+                                &mut first_err,
+                                &format!("qwen35 MoE EP rank{rank} KV clear"),
+                                e,
+                            );
+                        }
+                    } else {
+                        push_reset_err(
+                            &mut first_err,
+                            &format!("qwen35 MoE EP rank{rank} KV cache"),
+                            "missing",
+                        );
+                    }
+                    gpu.invalidate_graph_state();
                 }
             }
-            EpArch::Qwen35DenseTp { dn_states, .. } => {
-                for (rank, state) in dn_states.iter_mut().enumerate() {
+            EpArch::Qwen35DenseTp {
+                dn_states,
+                kv_caches,
+                ..
+            } => {
+                let rank_count = gpus.devices.len();
+                if dn_states.len() != rank_count {
+                    push_reset_err(
+                        &mut first_err,
+                        "dense qwen TP DN state rank count",
+                        format!("got {}, expected {rank_count}", dn_states.len()),
+                    );
+                }
+                if kv_caches.len() != rank_count {
+                    push_reset_err(
+                        &mut first_err,
+                        "dense qwen TP KV cache rank count",
+                        format!("got {}, expected {rank_count}", kv_caches.len()),
+                    );
+                }
+                for rank in 0..rank_count {
                     let gpu = &mut gpus.devices[rank];
                     if let Err(e) = gpu.bind_thread() {
                         push_reset_err(
@@ -757,11 +1404,34 @@ pub fn ep_reset_after_abort(m: &mut LoadedModel) -> RollbackEpilogue {
                             e,
                         );
                     }
-                    if let Err(e) = state.reset(gpu) {
+                    if let Some(state) = dn_states.get_mut(rank) {
+                        if let Err(e) = state.reset(gpu) {
+                            push_reset_err(
+                                &mut first_err,
+                                &format!("dense qwen TP rank{rank} state reset"),
+                                e,
+                            );
+                        }
+                    } else {
                         push_reset_err(
                             &mut first_err,
-                            &format!("dense qwen TP rank{rank} state reset"),
-                            e,
+                            &format!("dense qwen TP rank{rank} state"),
+                            "missing",
+                        );
+                    }
+                    if let Some(kv) = kv_caches.get_mut(rank) {
+                        if let Err(e) = kv.clear_gpu(gpu) {
+                            push_reset_err(
+                                &mut first_err,
+                                &format!("dense qwen TP rank{rank} KV clear"),
+                                e,
+                            );
+                        }
+                    } else {
+                        push_reset_err(
+                            &mut first_err,
+                            &format!("dense qwen TP rank{rank} KV cache"),
+                            "missing",
                         );
                     }
                     gpu.invalidate_graph_state();
@@ -800,10 +1470,26 @@ pub fn ep_reset_after_abort(m: &mut LoadedModel) -> RollbackEpilogue {
     }
 }
 
+/// Reset dense-TP state on every rank before publishing one fail-closed error.
+/// The common dispatcher selects the EP all-rank epilogue without requiring a
+/// separate daemon GPU handle.
+fn dense_tp_fail_closed_error(
+    m: &mut LoadedModel,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    message: &str,
+    class: &str,
+    retryable: bool,
+) {
+    let ep = crate::common::reset_mesh_request_state(m, None);
+    emit_fail_closed_error(stdout, Some(id), message, class, retryable, &ep);
+}
+
 /// EP cancel terminal: reset/sync first, then emit attempt-correlated
 /// `aborted`+`done(aborted)` only when rollback is attested. Unattested →
 /// one fail-closed error, no done.
 pub fn ep_emit_abort(
+    route: crate::ar::GenerationRoute,
     stdout: &mut std::io::Stdout,
     id: &str,
     m: &mut LoadedModel,
@@ -811,7 +1497,8 @@ pub fn ep_emit_abort(
 ) {
     let epilogue = ep_reset_after_abort(m);
     if !epilogue.rolled_back {
-        emit_fail_closed_error(
+        emit_fail_closed_error_for_route(
+            route,
             stdout,
             Some(id),
             "client cancelled; fail-closed EP rollback could not be attested",
@@ -821,11 +1508,7 @@ pub fn ep_emit_abort(
         );
         return;
     }
-    let attempt_id = active_attempt_id();
-    let (aborted, done) = ds4_ep_abort_wire_events(id, completion_tokens, attempt_id);
-    let _ = writeln!(stdout, "{}", aborted);
-    let _ = writeln!(stdout, "{}", done);
-    let _ = stdout.flush();
+    crate::ar::emit_generation_cancel(route, stdout, id, completion_tokens);
 }
 
 /// ds4 EP prefill + greedy decode.
@@ -971,7 +1654,12 @@ pub fn ep_serve_ds4(
     // a bespoke decode loop, so unlike the single-device AR/spec paths it does
     // not inherit their emitter-side latch.  Open it after all early request
     // validation but before prefill/decode can produce a client event.
-    emit_ds4_ep_gen_start(stdout, id, think_mode);
+    crate::ar::emit_generation_start(
+        crate::ar::GenerationRoute::Deepseek4Ep,
+        stdout,
+        id,
+        !matches!(think_mode, ThinkMode::NonThink),
+    );
 
     let t_prefill = Instant::now();
     // FIX #1 (ep-prefill-abort): set when check_abort fires inside the prefill
@@ -988,7 +1676,8 @@ pub fn ep_serve_ds4(
             prefill,
         } = inner
         else {
-            emit_active_attempt_error(
+            crate::ar::emit_generation_error(
+                crate::ar::GenerationRoute::Deepseek4Ep,
                 stdout,
                 Some(id),
                 "EP arch mismatch (expected ds4)",
@@ -1011,7 +1700,8 @@ pub fn ep_serve_ds4(
                 &prompt_ids,
                 0,
             ) {
-                emit_active_attempt_error(
+                crate::ar::emit_generation_error(
+                    crate::ar::GenerationRoute::Deepseek4Ep,
                     stdout,
                     Some(id),
                     &format!(
@@ -1046,7 +1736,8 @@ pub fn ep_serve_ds4(
                 if let Err(e) = deepseek4::forward::forward_ep(
                     gpus, weights, config, state, partials, t, pos as u32,
                 ) {
-                    emit_active_attempt_error(
+                    crate::ar::emit_generation_error(
+                        crate::ar::GenerationRoute::Deepseek4Ep,
                         stdout,
                         Some(id),
                         &format!("forward_ep prefill: {}", format!("{e}").replace('"', "'")),
@@ -1068,14 +1759,15 @@ pub fn ep_serve_ds4(
     // Mirror the single-GPU paths: emit aborted+done and reset every rank's KV
     // cursor.
     if aborted_in_prefill || check_abort(id) {
-        ep_emit_abort(stdout, id, m, 0);
+        ep_emit_abort(crate::ar::GenerationRoute::Deepseek4Ep, stdout, id, m, 0);
         return;
     }
     let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
     let mut logits = {
         let EpState { gpus, inner } = m.ep.as_mut().unwrap();
         let EpArch::Ds4 { state, .. } = inner else {
-            emit_active_attempt_error(
+            crate::ar::emit_generation_error(
+                crate::ar::GenerationRoute::Deepseek4Ep,
                 stdout,
                 Some(id),
                 "EP arch mismatch (expected ds4)",
@@ -1094,7 +1786,8 @@ pub fn ep_serve_ds4(
             Some(l) => match gpus.devices[0].download_f32(l) {
                 Ok(v) => v,
                 Err(e) => {
-                    emit_active_attempt_error(
+                    crate::ar::emit_generation_error(
+                        crate::ar::GenerationRoute::Deepseek4Ep,
                         stdout,
                         Some(id),
                         &format!(
@@ -1110,7 +1803,8 @@ pub fn ep_serve_ds4(
                 }
             },
             None => {
-                emit_active_attempt_error(
+                crate::ar::emit_generation_error(
+                    crate::ar::GenerationRoute::Deepseek4Ep,
                     stdout,
                     Some(id),
                     "EP logits unset after prefill",
@@ -1134,7 +1828,13 @@ pub fn ep_serve_ds4(
         // reset EP cursors, stop. Without this a Pi/CLI cancel leaves the EP
         // decode loop running for the full max_tokens of wasted multi-GPU work.
         if check_abort(id) {
-            ep_emit_abort(stdout, id, m, generated);
+            ep_emit_abort(
+                crate::ar::GenerationRoute::Deepseek4Ep,
+                stdout,
+                id,
+                m,
+                generated,
+            );
             return;
         }
         if grammar_active && !matcher.is_free() {
@@ -1190,7 +1890,8 @@ pub fn ep_serve_ds4(
         if let Err(e) =
             deepseek4::forward::forward_ep(gpus, weights, config, state, partials, next, pos as u32)
         {
-            emit_active_attempt_error(
+            crate::ar::emit_generation_error(
+                crate::ar::GenerationRoute::Deepseek4Ep,
                 stdout,
                 Some(id),
                 &format!("forward_ep decode: {}", format!("{e}").replace('"', "'")),
@@ -1209,7 +1910,8 @@ pub fn ep_serve_ds4(
             Some(l) => match gpus.devices[0].download_f32(l) {
                 Ok(v) => v,
                 Err(e) => {
-                    emit_active_attempt_error(
+                    crate::ar::emit_generation_error(
+                        crate::ar::GenerationRoute::Deepseek4Ep,
                         stdout,
                         Some(id),
                         &format!(
@@ -1282,7 +1984,13 @@ pub fn ep_serve_ds4(
     let decision = await_client_terminal_commit(stdout, id, &pending_done);
     let effects = ds4_client_commit_effects(decision, finish_reason == "tool_calls", store_cache);
     if !effects.emit_done {
-        ep_emit_abort(stdout, id, m, generated);
+        ep_emit_abort(
+            crate::ar::GenerationRoute::Deepseek4Ep,
+            stdout,
+            id,
+            m,
+            generated,
+        );
         return;
     }
     let mut action = ds4_ar_ep_cache_action(&terminal, &emit_text_buf);
@@ -1329,7 +2037,11 @@ pub fn ep_serve_ds4(
         );
     }
 
-    emit_staged_terminal_done(stdout, &pending_done);
+    crate::ar::emit_generation_done_value(
+        crate::ar::GenerationRoute::Deepseek4Ep,
+        stdout,
+        &pending_done,
+    );
     let _ = stdout.flush();
 }
 
@@ -1353,6 +2065,12 @@ pub fn ep_serve_minimax(
 ) {
     use std::time::Instant;
     let prompt_n = prompt_ids.len();
+    crate::ar::emit_generation_start(
+        crate::ar::GenerationRoute::MiniMaxEp,
+        stdout,
+        id,
+        primed_think,
+    );
 
     // O2b-2 capacity guard (minimax EP): even with LCP reuse the KV ends up
     // holding [0, prompt_n) after prefill, then decode appends max_tokens, so
@@ -1363,13 +2081,17 @@ pub fn ep_serve_minimax(
     // saturating_add: an adversarially huge max_tokens must not wrap usize and
     // slip under the cap.
     if prompt_n.saturating_add(max_tokens) > m.physical_cap {
-        emit_active_attempt_error(
+        crate::ar::emit_generation_error(
+            crate::ar::GenerationRoute::MiniMaxEp,
             stdout,
             Some(id),
-            &format!("prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq", prompt_n, max_tokens, m.physical_cap),
+            &format!(
+                "prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq",
+                prompt_n, max_tokens, m.physical_cap
+            ),
             "context_length",
             false,
-            false
+            false,
         );
         let _ = stdout.flush();
         return;
@@ -1388,7 +2110,11 @@ pub fn ep_serve_minimax(
             lcp += 1;
         }
         let cache_hit = lcp > 0 && lcp < prompt_n;
-        if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+        if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
             eprintln!(
                 "[minimax-ep-cache] prior_len={} rendered_len={} lcp={} hit={} partial={}",
                 prior_len,
@@ -1435,7 +2161,8 @@ pub fn ep_serve_minimax(
             partials,
         } = inner
         else {
-            emit_active_attempt_error(
+            crate::ar::emit_generation_error(
+                crate::ar::GenerationRoute::MiniMaxEp,
                 stdout,
                 Some(id),
                 "EP arch mismatch (expected minimax)",
@@ -1461,7 +2188,8 @@ pub fn ep_serve_minimax(
             if let Err(e) =
                 minimax::forward::forward_ep(gpus, weights, config, state, partials, t, pos)
             {
-                emit_active_attempt_error(
+                crate::ar::emit_generation_error(
+                    crate::ar::GenerationRoute::MiniMaxEp,
                     stdout,
                     Some(id),
                     &format!("forward_ep prefill: {}", format!("{e}").replace('"', "'")),
@@ -1487,7 +2215,7 @@ pub fn ep_serve_minimax(
     // cleanly. `aborted_in_prefill` already consumed the signal mid-loop; the
     // post-loop check_abort catches a cancel that arrived after the last token.
     if aborted_in_prefill || check_abort(id) {
-        ep_emit_abort(stdout, id, m, 0);
+        ep_emit_abort(crate::ar::GenerationRoute::MiniMaxEp, stdout, id, m, 0);
         return;
     }
 
@@ -1505,6 +2233,15 @@ pub fn ep_serve_minimax(
     let mut logits = {
         let EpState { gpus, inner } = m.ep.as_mut().unwrap();
         let EpArch::Minimax { state, .. } = inner else {
+            crate::ar::emit_generation_error(
+                crate::ar::GenerationRoute::MiniMaxEp,
+                stdout,
+                Some(id),
+                "EP arch mismatch (expected minimax)",
+                "validation",
+                false,
+                false,
+            );
             return;
         };
         let _ = gpus.devices[0].bind_thread();
@@ -1513,7 +2250,8 @@ pub fn ep_serve_minimax(
         match gpus.devices[0].download_f32(&state[0].logits) {
             Ok(v) => v,
             Err(e) => {
-                emit_active_attempt_error(
+                crate::ar::emit_generation_error(
+                    crate::ar::GenerationRoute::MiniMaxEp,
                     stdout,
                     Some(id),
                     &format!(
@@ -1538,7 +2276,13 @@ pub fn ep_serve_minimax(
         // FIX #3 (ep-no-abort): client cancel mid-decode → emit aborted+done,
         // reset EP cursors, stop.
         if check_abort(id) {
-            ep_emit_abort(stdout, id, m, generated);
+            ep_emit_abort(
+                crate::ar::GenerationRoute::MiniMaxEp,
+                stdout,
+                id,
+                m,
+                generated,
+            );
             return;
         }
         // Host-side sampler over downloaded f32 logits (temp → top_k → top_p →
@@ -1576,7 +2320,8 @@ pub fn ep_serve_minimax(
         if let Err(e) =
             minimax::forward::forward_ep(gpus, weights, config, state, partials, next, pos as u32)
         {
-            emit_active_attempt_error(
+            crate::ar::emit_generation_error(
+                crate::ar::GenerationRoute::MiniMaxEp,
                 stdout,
                 Some(id),
                 &format!("forward_ep decode: {}", format!("{e}").replace('"', "'")),
@@ -1594,7 +2339,8 @@ pub fn ep_serve_minimax(
         logits = match gpus.devices[0].download_f32(&state[0].logits) {
             Ok(v) => v,
             Err(e) => {
-                emit_active_attempt_error(
+                crate::ar::emit_generation_error(
+                    crate::ar::GenerationRoute::MiniMaxEp,
                     stdout,
                     Some(id),
                     &format!(
@@ -1616,6 +2362,7 @@ pub fn ep_serve_minimax(
         "stop"
     };
     ep_emit_done(
+        crate::ar::GenerationRoute::MiniMaxEp,
         stdout,
         id,
         m,
@@ -1637,7 +2384,9 @@ pub fn ep_serve_minimax(
 /// byte-consistent — a mismatch would break the LCP forward-extension.
 pub fn qwen_history_tool_render(model_path: &str) -> hipfire_runtime::prompt_frame::ToolCallRender {
     hipfire_runtime::prompt_frame::qwen35_history_render(
-        hipfire_config::developer_var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref(),
+        hipfire_config::developer_var("HIPFIRE_QWEN35_GRAMMAR")
+            .ok()
+            .as_deref(),
         model_path,
     )
 }
@@ -1723,12 +2472,27 @@ pub fn plan_from_rendered(
         while lcp < max_match && conversation_tokens[lcp] == rendered[lcp] {
             lcp += 1;
         }
-        if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+        if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
             eprintln!(
                 "[qwen-cache lcp {trace_tag}] prior_len={} rendered_len={} lcp={}",
                 prior_len,
                 rendered.len(),
                 lcp
+            );
+            // Bounded token evidence around the first divergence: at most 24 ids
+            // per side, enough to pin an envelope/span off-by-one without
+            // dumping whole conversations.
+            let lo = lcp.saturating_sub(8);
+            let prior_hi = (lcp + 16).min(prior_len);
+            let rend_hi = (lcp + 16).min(rendered.len());
+            eprintln!(
+                "[qwen-cache ids {trace_tag}] prior[{lo}..{prior_hi}]={:?} rendered[{lo}..{rend_hi}]={:?}",
+                &conversation_tokens[lo..prior_hi],
+                &rendered[lo..rend_hi],
             );
         }
         if lcp == prior_len && lcp < rendered.len() && lcp > 0 {
@@ -1775,6 +2539,43 @@ pub fn plan_from_rendered(
         resume_from: None,
         rendered,
     }
+}
+
+/// Qwen jinja cache-lookup turn synthesis: fingerprint the message's normalized
+/// content (+ tool identity) and forward the stored producer reasoning so rich
+/// `reasoning_content` history satisfies the splice text check. Primer rule: a
+/// whole-envelope turn (reasoning present) replays verbatim — the template
+/// re-emits every marker around its slots, so prepending would duplicate the
+/// think opener. A primer-less full body (no reasoning) gets the generation
+/// primer prepended so the spliced stream byte-matches the end-of-turn bake on
+/// bare-history templates. Returns `None` on fingerprint miss or a content-less
+/// entry. Tool slots stay empty — Qwen history tool turns keep the existing
+/// safe miss via the count check.
+pub fn qwen_jinja_lookup_turn(
+    cache: &mut AsstTurnCache,
+    msg: &hipfire_runtime::prompt_frame::Message,
+    primer: &[u32],
+) -> Option<hipfire_runtime::prompt_frame::CachedAssistantTurn> {
+    let normalized = normalize_asst_turn_for_fingerprint(&msg.content);
+    let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
+    cache.get(&fp).and_then(|turn| {
+        turn.content.as_ref().map(|c| {
+            let mut v = if turn.reasoning.is_some() {
+                Vec::new()
+            } else {
+                primer.to_vec()
+            };
+            v.extend_from_slice(&c.token_ids);
+            hipfire_runtime::prompt_frame::CachedAssistantTurn {
+                reasoning: turn.reasoning.clone(),
+                tools: Vec::new(),
+                content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
+                    token_ids: v,
+                    text: msg.content.clone(),
+                }),
+            }
+        })
+    })
 }
 
 /// DFlash-powered greedy decode. Mirrors `generate`'s ChatML shape and
@@ -1960,7 +2761,10 @@ pub fn generate_dflash(
     // template for ALL arches; opt out with HIPFIRE_JINJA_CHAT=0 (hand-rolled
     // ChatML/Plain). No template ⇒ Plain. Template present + render Err ⇒
     // fail closed (see match below).
-    let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+    let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
+        .ok()
+        .as_deref()
+        != Some("0");
     let try_jinja = jinja_enabled && m.chat_template.is_some();
     let mut started_in_think = matches!(
         assistant_prefix,
@@ -2075,7 +2879,16 @@ pub fn generate_dflash(
         .as_ref()
         .map(|s| s.ctx_capacity())
         .unwrap_or(usize::MAX);
-    if prompt_tokens.len().saturating_add(max_tokens) > spec_ctx_capacity {
+    let spec_block_size = m.speculator.as_ref().map(|s| s.block_size()).unwrap_or(0);
+    // Shared margin with the `generate_spec` hard guard below: prompt +
+    // budget + one draft block must fit, so any request the loop would refuse
+    // falls back to AR here instead of erroring after `gen_start`.
+    if !spec_ctx_request_fits(
+        prompt_tokens.len(),
+        max_tokens,
+        spec_block_size,
+        spec_ctx_capacity,
+    ) {
         emit_qwen_ar_info(
             stdout,
             id,
@@ -2103,7 +2916,10 @@ pub fn generate_dflash(
     // spliced stream byte-matches the end-of-turn bake. Divergence (edited
     // history, roundtrip-unstable text) lands on the checkpoint-resume path —
     // worst case equals today's cold prefill, never wrong tokens.
-    let cache_disabled = hipfire_config::developer_var("HIPFIRE_QWEN_PROMPT_CACHE").ok().as_deref() == Some("0");
+    let cache_disabled = hipfire_config::developer_var("HIPFIRE_QWEN_PROMPT_CACHE")
+        .ok()
+        .as_deref()
+        == Some("0");
     // DFlash divergent-render resume (default ON; opt out with
     // HIPFIRE_DFLASH_CKPT_RESUME=0). Requires no eviction (resume rewinds the
     // resident KV prefix). When on, the recurrent state is checkpointed during
@@ -2111,7 +2927,9 @@ pub fn generate_dflash(
     // ≤ lcp — byte-identical to a cold prefill of the same render (verified),
     // so worst case equals the legacy cold-reset path. Off ⇒ no checkpoints
     // (zero overhead) + legacy cold-reset-on-divergence.
-    let dflash_resume_enabled = hipfire_config::developer_var("HIPFIRE_DFLASH_CKPT_RESUME").ok().as_deref()
+    let dflash_resume_enabled = hipfire_config::developer_var("HIPFIRE_DFLASH_CKPT_RESUME")
+        .ok()
+        .as_deref()
         != Some("0")
         && m.eviction.is_none();
     let dflash_ckpt_positions: Vec<usize> = m
@@ -2127,9 +2945,10 @@ pub fn generate_dflash(
     let cache_plan: Option<PromptCachePlan> = if try_jinja {
         if let Some(hist) = messages_history {
             // Assistant-opener primer from THIS turn's cold jinja render
-            // (everything after the last `<|im_start|>assistant\n`) — the
-            // template renders history turns without it, so the replay
-            // prepends it (mirrors generate()'s item-#37 primer).
+            // (everything after the last `<|im_start|>assistant\n`). The
+            // replay prepends it only when the template does not already
+            // re-emit it on history assistant turns (Qwen3.5 does not,
+            // Qwen3.8 does) — mirrors generate()'s item-#37 primer.
             let tok = m.tokenizer.as_ref().unwrap();
             let im_start = tok.special_token_id("<|im_start|>");
             let opener_len = tok.encode("<|im_start|>assistant\n").len();
@@ -2151,36 +2970,26 @@ pub fn generate_dflash(
                 reasoning_strength: None,
                 reasoning_effort,
             };
+            let primer: Vec<u32> =
+                if hipfire_runtime::prompt_frame::template_emits_history_primer(&frame, &primer) {
+                    Vec::new()
+                } else {
+                    primer
+                };
             let cache_ref = &mut m.asst_turn_cache;
-            let trace_cache =
-                hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1");
+            let trace_cache = hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+                .ok()
+                .as_deref()
+                == Some("1");
             let rendered = match hipfire_runtime::prompt_frame::build_cached_history_jinja(
                 &frame,
                 hist,
                 tools,
                 |msg| {
-                    let normalized = normalize_asst_turn_for_fingerprint(&msg.content);
-                    let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
-                    // The qwen family has no Harmony reasoning/tool channels: its whole
-                    // assistant turn is one content slot. `text` must be the message's own
-                    // content so the splice's `content.text == m.content` guard
-                    // (prompt_frame.rs) passes trivially and behaviour is byte-identical to
-                    // the pre-per-channel implementation.
-                    let hit = cache_ref.get(&fp).and_then(|turn| {
-                        turn.content.as_ref().map(|c| {
-                            let mut v = primer.clone();
-                            v.extend_from_slice(&c.token_ids);
-                            hipfire_runtime::prompt_frame::CachedAssistantTurn {
-                                reasoning: None,
-                                tools: Vec::new(),
-                                content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
-                                    token_ids: v,
-                                    text: msg.content.clone(),
-                                }),
-                            }
-                        })
-                    });
+                    let hit = qwen_jinja_lookup_turn(&mut *cache_ref, msg, &primer);
                     if trace_cache {
+                        let normalized = normalize_asst_turn_for_fingerprint(&msg.content);
+                        let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
                         eprintln!(
                             "[qwen-cache jinja lookup dflash] fp={:#018x} role={:?} primer={} hit={}",
                             fp,
@@ -2274,17 +3083,17 @@ pub fn generate_dflash(
     // qwen35 enforces tool-call grammar POST-acceptance inside the emitter
     // (`Qwen35Emit::observe`); the emitter now extracts its own `ToolSchema`
     // list from the raw tool JSON inside `make_spec_emitter`. This wrapper only
-    // honors the `HIPFIRE_QWEN35_GRAMMAR=0` kill-switch by withholding `tools`
-    // (⇒ empty schema ⇒ grammar inactive).
+    // honors the `HIPFIRE_QWEN35_GRAMMAR=0` kill-switch by setting
+    // `enable_grammar=false` (empty schema ⇒ matcher inactive). Tools still
+    // reach SpecEmit so ToolOutputRouter parses native XML; withholding them
+    // used to leak `<tool_call>` as assistant content (Hermes never executed).
     let grammar_enabled = hipfire_runtime::prompt_frame::qwen35_grammar_on(
-        hipfire_config::developer_var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref(),
+        hipfire_config::developer_var("HIPFIRE_QWEN35_GRAMMAR")
+            .ok()
+            .as_deref(),
         &m.model_path,
     );
-    let emit_tools: Option<Vec<serde_json::Value>> = if grammar_enabled {
-        tools.map(|t| t.to_vec())
-    } else {
-        None
-    };
+    let emit_tools: Option<Vec<serde_json::Value>> = tools.map(|t| t.to_vec());
 
     // The decode core (slot guard, prefill, accept-window loop, bake, finish) is
     // the arch-generic `generate_spec`. This wrapper owns the qwen35/llama-specific
@@ -2305,7 +3114,10 @@ pub fn generate_dflash(
             cactus_delta,
             rng_seed: request_seed,
             allow_ngram_modifier: spec_name == "mtp"
-                && hipfire_config::developer_var("HIPFIRE_MTP_NGRAM").ok().as_deref() == Some("1")
+                && hipfire_config::developer_var("HIPFIRE_MTP_NGRAM")
+                    .ok()
+                    .as_deref()
+                    == Some("1")
                 && temp <= 1e-6
                 && max_think_tokens == 1,
         });
@@ -2317,11 +3129,11 @@ pub fn generate_dflash(
     // Advertise semantic-v2 only when this turn's arch has a correlated
     // router-backed DFlash producer (qwen35 / qwen35-vl). Other arches still
     // use whole-output tool extraction and stay on legacy contract.
-    emit_gen_start(
+    crate::ar::emit_generation_start(
+        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::QwenDflash),
         stdout,
         id,
         started_in_think,
-        gen_start_contract_version_for_arch(m.arch_id),
     );
     let run = match generate_spec(
         m,
@@ -2337,6 +3149,7 @@ pub fn generate_dflash(
         SpecEmitRequest {
             im_end: im_end_token,
             tools: emit_tools,
+            enable_grammar: grammar_enabled,
             stop: stop.to_vec(),
             max_think: max_think_tokens,
             assistant_prefix: spec_assistant_prefix(started_in_think),
@@ -2430,8 +3243,10 @@ pub fn generate_dflash(
                 im_end_token,
             );
         let semantic_stop = run.semantic_stop.is_some();
-        let hit_length_cap =
-            qwen_dflash_hit_length_cap(run.generated, max_tokens, decoded_eot, semantic_stop);
+        // A ctx-exhausted mid-loop break is a length stop even when the token
+        // budget is unspent: same `length` + no-store path as the cap below.
+        let hit_length_cap = run.ctx_exhausted
+            || qwen_dflash_hit_length_cap(run.generated, max_tokens, decoded_eot, semantic_stop);
         // Prefer producer-visible channel; fall back to finish Token events.
         let visible = if !run.finish.visible_text.is_empty() {
             run.finish.visible_text.clone()
@@ -2565,7 +3380,11 @@ pub fn generate_dflash(
                 let mut action = qwen_dflash_cache_action(&terminal);
                 action.store = effects.store_cache && action.store;
                 if action.store {
-                    if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+                    if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+                        .ok()
+                        .as_deref()
+                        == Some("1")
+                    {
                         eprintln!(
                             "[qwen-cache store dflash] fp_text.len={} tool_calls={} preview={:?}",
                             action.fingerprint_text.len(),
@@ -2573,21 +3392,40 @@ pub fn generate_dflash(
                             action.fingerprint_text.chars().take(60).collect::<String>(),
                         );
                     }
+                    // Whole-envelope store: FULL generated body verbatim plus
+                    // producer reasoning text when the turn thought. Splice
+                    // replays R...A as one span; primer stays lookup-side.
+                    let tok = m.tokenizer.as_ref().unwrap();
                     let _ = qwen_dflash_apply_cache_action(
                         |fp, seq| {
-                            if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref()
+                            let reasoning =
+                                hipfire_runtime::prompt_frame::cached_producer_reasoning_text(
+                                    tok,
+                                    &seq,
+                                    started_in_think,
+                                )
+                                .map(|text| {
+                                    hipfire_runtime::prompt_frame::CachedAssistantBody {
+                                        token_ids: Vec::new(),
+                                        text,
+                                    }
+                                });
+                            if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+                                .ok()
+                                .as_deref()
                                 == Some("1")
                             {
                                 eprintln!(
-                                    "[qwen-cache store dflash] fp={:#018x} cached_seq={}",
+                                    "[qwen-cache store dflash] fp={:#018x} cached_seq={} span={}",
                                     fp,
-                                    seq.len()
+                                    seq.len(),
+                                    reasoning.is_some(),
                                 );
                             }
                             m.asst_turn_cache.insert(
                                 fp,
                                 hipfire_runtime::prompt_frame::CachedAssistantTurn {
-                                    reasoning: None,
+                                    reasoning,
                                     tools: Vec::new(),
                                     content: Some(
                                         hipfire_runtime::prompt_frame::CachedAssistantBody {
@@ -2602,7 +3440,7 @@ pub fn generate_dflash(
                         cached_seq,
                     );
                 }
-                emit_staged_terminal_done(stdout, &pending_done);
+                crate::ar::emit_active_route_done_value(stdout, &pending_done);
             }
         }
     } else {
@@ -2637,12 +3475,13 @@ pub fn generate_dflash(
         let emit_tool_calls = extract_tool_calls_from_text(&decoded_full);
         // Semantic stop / decoded_eot at the budget boundary is stop/tool_calls,
         // not length — same rule as the qwen_semantic_v2 path.
-        let hit_length_cap = qwen_dflash_hit_length_cap(
-            run.generated,
-            max_tokens,
-            run.finish.decoded_eot,
-            run.semantic_stop.is_some(),
-        );
+        let hit_length_cap = run.ctx_exhausted
+            || qwen_dflash_hit_length_cap(
+                run.generated,
+                max_tokens,
+                run.finish.decoded_eot,
+                run.semantic_stop.is_some(),
+            );
         let finish_reason = if hit_length_cap {
             "length"
         } else if !emit_tool_calls.is_empty() {
@@ -2732,13 +3571,19 @@ pub fn generate_dflash(
             let emit_text =
                 hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
             let fp = asst_turn_fingerprint(&emit_text, &wire_calls);
-            if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+            if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+                .ok()
+                .as_deref()
+                == Some("1")
+            {
                 eprintln!(
                     "[qwen-cache store dflash] fp={:#018x} cached_seq={} emit_text.len={} tool_calls={} preview={:?}",
                     fp, cached_seq.len(), emit_text.len(), wire_calls.len(),
                     emit_text.chars().take(60).collect::<String>(),
                 );
             }
+            // Legacy (non-qwen-semantic-v2) arches: content-only full body store.
+            // Rich whole-envelope reasoning text is the qwen semantic-v2 path above.
             m.asst_turn_cache.insert(
                 fp,
                 hipfire_runtime::prompt_frame::CachedAssistantTurn {
@@ -2751,7 +3596,7 @@ pub fn generate_dflash(
                 },
             );
         }
-        emit_staged_terminal_done(stdout, &pending_done);
+        crate::ar::emit_active_route_done_value(stdout, &pending_done);
     }
     let _ = stdout.flush();
     // Per-request debug summary (stderr → serve.log): active drafter, τ, tok/s.
@@ -2794,7 +3639,7 @@ pub fn generate_spec(
     // Zero-budget reject: no first token, no prefill/GPU/state/client mutation.
     // Correlated validation error only — wrapper sees None and skips done/cache.
     if max_tokens == 0 {
-        emit_active_attempt_error(
+        crate::ar::emit_active_route_error(
             stdout,
             Some(id),
             "max_tokens must be > 0",
@@ -2809,7 +3654,7 @@ pub fn generate_spec(
     // Adaptive KV has no maybe_downshift on the generic spec path. Fail closed
     // rather than run unsupported speculation past floor-reserved capacity.
     if m.kv_adaptive.is_some() {
-        emit_active_attempt_error(
+        crate::ar::emit_active_route_error(
             stdout,
             Some(id),
             "kv_adaptive cannot use generic speculative decode (DFlash/DSpark/MTP/n-gram); use AR",
@@ -2832,7 +3677,7 @@ pub fn generate_spec(
     let (block_size, ctx_capacity) = match m.speculator.as_ref() {
         Some(s) => (s.block_size(), s.ctx_capacity()),
         None => {
-            emit_active_attempt_error(
+            crate::ar::emit_active_route_error(
                 stdout,
                 Some(id),
                 "dflash path entered without a loaded speculator",
@@ -2852,7 +3697,7 @@ pub fn generate_spec(
     let carrier = match hipfire_loader::carrier_for(arch_id) {
         Some(c) => c,
         None => {
-            emit_active_attempt_error(
+            crate::ar::emit_active_route_error(
                 stdout,
                 Some(id),
                 &format!("no carrier for arch_id {}", arch_id),
@@ -2872,7 +3717,7 @@ pub fn generate_spec(
     let mut guard = match carrier.spec_target_guard(&mut m.state, &m.model_path) {
         Ok(g) => g,
         Err(e) => {
-            emit_active_attempt_error(
+            crate::ar::emit_active_route_error(
                 stdout,
                 Some(id),
                 &format!("{}", e),
@@ -2895,7 +3740,7 @@ pub fn generate_spec(
         let slot = match guard.slot() {
             Ok(s) => s,
             Err(e) => {
-                emit_active_attempt_error(
+                crate::ar::emit_active_route_error(
                     stdout,
                     Some(id),
                     &format!("{}", e),
@@ -2937,7 +3782,11 @@ pub fn generate_spec(
         // bookkeeping remains.
         m.seq_pos = 0;
         m.conversation_tokens.clear();
-    } else if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+    } else if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
         eprintln!(
             "[qwen-cache HIT dflash] reuse prefix={} suffix={} (no reset)",
             prefill_start,
@@ -2957,7 +3806,7 @@ pub fn generate_spec(
         ctx_capacity
     };
     if prompt_tokens.len().saturating_add(block_size) > eff_prompt_cap {
-        emit_active_attempt_error(
+        crate::ar::emit_active_route_error(
             stdout,
             Some(id),
             &format!(
@@ -2977,14 +3826,13 @@ pub fn generate_spec(
         let _ = stdout.flush();
         return None;
     }
+    // Shared margin with the `generate_dflash` entry fallback above (same
+    // predicate): without eviction the entry already diverted these to AR,
+    // so this is belt-and-suspenders for direct `generate_spec` callers.
     if m.eviction.is_none()
-        && prompt_tokens
-            .len()
-            .saturating_add(max_tokens)
-            .saturating_add(block_size)
-            > ctx_capacity
+        && !spec_ctx_request_fits(prompt_tokens.len(), max_tokens, block_size, ctx_capacity)
     {
-        emit_active_attempt_error(
+        crate::ar::emit_active_route_error(
             stdout,
             Some(id),
             &format!(
@@ -3009,7 +3857,7 @@ pub fn generate_spec(
     let slot = match guard.slot() {
         Ok(s) => s,
         Err(e) => {
-            emit_active_attempt_error(
+            crate::ar::emit_active_route_error(
                 stdout,
                 Some(id),
                 &format!("{}", e),
@@ -3085,6 +3933,29 @@ pub fn generate_spec(
         drop(guard);
         return None;
     }
+    // serve-fault-inject: after-first-decode fault on the spec route. Sits
+    // with the prefill seam (not after the first spec.step): the prefill
+    // already ran the first target decode and `begin` below makes the first
+    // token wire-visible, so firing later would leak a `token` before the
+    // fail-closed terminal. Consumes the same `test_fault_after_first_decode`
+    // arm the AR loop consults at `ar.rs:4249` — no new mechanism.
+    #[cfg(feature = "serve-fault-inject")]
+    if maybe_inject_fault_after_first_decode_dflash(
+        arch_id,
+        &mut m.seq_pos,
+        &mut m.conversation_tokens,
+        &mut m.prefill_checkpoints,
+        &mut m.dflash_checkpoints,
+        &mut m.asst_turn_cache,
+        gpu,
+        stdout,
+        id,
+        slot,
+        spec.as_mut(),
+    ) {
+        drop(guard);
+        return None;
+    }
 
     let t_prefill = Instant::now();
 
@@ -3100,6 +3971,7 @@ pub fn generate_spec(
         eos: slot.eos_token(),
         im_end: emit_req.im_end,
         tools: emit_req.tools.as_deref(),
+        enable_grammar: emit_req.enable_grammar,
         stop: emit_req.stop,
         max_think: emit_req.max_think,
         max_tokens,
@@ -3110,15 +3982,25 @@ pub fn generate_spec(
     let mut emit: Box<dyn SpecEmit> = match carrier.make_spec_emitter(emit_ctx) {
         Ok(e) => e,
         Err(e) => {
-            emit_active_attempt_error(
-                stdout,
-                Some(id),
-                &format!("{}", e),
-                "validation",
-                false,
-                false,
+            // Post-prefill failure: the target's KV/DeltaNet/drafter hidden
+            // already advanced and host seq_pos/conversation_tokens were
+            // cleared on a cold start. Fail closed like every other
+            // post-prefill error exit (prefill/step Err, realign, forced
+            // terminal): live rollback first, then one correlated error —
+            // otherwise the next turn LCPs against a dirty GPU
+            // (audit-Dflash Broken 4).
+            let msg = format!("make_spec_emitter: {e}");
+            let ep = production_fail_closed_rollback_live(
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                gpu,
+                slot,
+                spec.as_mut(),
             );
-            let _ = stdout.flush();
+            emit_fail_closed_error(stdout, Some(id), &msg, "validation", false, &ep);
             return None;
         }
     };
@@ -3141,6 +4023,11 @@ pub fn generate_spec(
     let mut spec_cycles = 0usize;
     let mut spec_accepted = 0usize;
     let mut generated = 0usize;
+    // Set when the mid-loop `position + block_size >= ctx_capacity` break
+    // fires: the draft's context-indexed structures cannot host another
+    // full block, so the epilogue must report a length stop
+    // (`finish_reason=length`, no cache store) rather than a natural stop.
+    let mut ctx_exhausted = false;
 
     // Post-prefill compaction (FlashCASK pattern from dflash_spec_demo).
     // If the prompt already filled past budget+beta, compact once before
@@ -3335,6 +4222,7 @@ pub fn generate_spec(
     // Fast path exit conditions (mirrors the dflash_spec_demo outer loop).
     // `!first_token_is_eos` short-circuits the entire spec loop when the prefill's
     // first sampled token was already a terminator (see the guard above).
+    let mut terminal_cache_invalidated = false;
     while !first_token_is_eos && generated < max_tokens {
         // Decode-side abort (dflash path). See the matching block in
         // `generate()` for rationale. Without this, a Pi cancel
@@ -3356,6 +4244,7 @@ pub fn generate_spec(
             return None;
         }
         if position.saturating_add(block_size) >= ctx_capacity {
+            ctx_exhausted = true;
             break;
         }
 
@@ -3367,6 +4256,7 @@ pub fn generate_spec(
         // matcher so the fused step constrains drafts in-place. `emit.grammar()`'s
         // borrow ends when `step` returns, before the per-token `emit.observe`.
         let max_emit = max_tokens.saturating_sub(generated);
+        let window_seed = seed_token;
         let step = match spec.step(
             gpu,
             slot,
@@ -3515,9 +4405,10 @@ pub fn generate_spec(
         };
 
         // Strict-prefix semantic stop: drop unobserved speculative tail from
-        // target + drafter via conservative reset + production prefill of the
-        // exact KV-resident prefix (`spec_prefix_realign_plan`). Full-window
-        // observe keeps the step's already-committed GPU state.
+        // target + drafter. Continue-generation paths rebuild the exact
+        // KV-resident prefix; completed requests reset and invalidate cache
+        // metadata so they do not pay a full-history replay before returning.
+        // Full-window observe keeps the step's already-committed GPU state.
         //
         // Capacity-aware: admit BEFORE reset/prefill. Realign is full-history
         // replay after reset (compact_offset cleared) — never overrun
@@ -3525,7 +4416,95 @@ pub fn generate_spec(
         // state from an invalid oversize history. Abort/prefill errors share
         // the single fail-closed terminal (no second done/error).
         let keep = consumed.min(committed_tail.len());
-        if keep < committed_tail.len() {
+        let strict_prefix_action =
+            spec_strict_prefix_action(keep, committed_tail.len(), hit_eos || think_cap_hit);
+        if strict_prefix_action == SpecStrictPrefixAction::RepairForTerminal {
+            // Prefer a window-local repair: restore the pre-window target/drafter
+            // snapshot and replay only the consumed prefix. Speculators without
+            // that capability retain the conservative reset + cache invalidation.
+            let repaired = match spec.repair_terminal_prefix(
+                gpu,
+                slot,
+                position_before,
+                window_seed,
+                &committed_tail[..keep],
+            ) {
+                Ok(repaired) => repaired,
+                Err(e) => {
+                    let ep = production_fail_closed_rollback_live(
+                        &mut m.seq_pos,
+                        &mut m.conversation_tokens,
+                        &mut m.prefill_checkpoints,
+                        &mut m.dflash_checkpoints,
+                        &mut m.asst_turn_cache,
+                        gpu,
+                        slot,
+                        spec.as_mut(),
+                    );
+                    emit_fail_closed_error(
+                        stdout,
+                        Some(id),
+                        &format!("terminal prefix repair failed: {e}"),
+                        "gpu",
+                        true,
+                        &ep,
+                    );
+                    drop(guard);
+                    return None;
+                }
+            };
+            if repaired
+                && hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+                    .ok()
+                    .as_deref()
+                    == Some("1")
+            {
+                eprintln!(
+                    "[qwen-cache terminal-repair] window_start={} consumed={} replayed={}",
+                    position_before, keep, keep
+                );
+            }
+            let reset_error = if repaired {
+                None
+            } else {
+                slot.reset_recurrent(gpu)
+                    .err()
+                    .map(|e| format!("reset_recurrent: {e}"))
+                    .or_else(|| {
+                        spec.reset_for_realign(gpu)
+                            .err()
+                            .map(|e| format!("spec.reset_for_realign: {e}"))
+                    })
+            };
+            if let Some(msg) = reset_error {
+                let ep = production_fail_closed_rollback_live(
+                    &mut m.seq_pos,
+                    &mut m.conversation_tokens,
+                    &mut m.prefill_checkpoints,
+                    &mut m.dflash_checkpoints,
+                    &mut m.asst_turn_cache,
+                    gpu,
+                    slot,
+                    spec.as_mut(),
+                );
+                emit_fail_closed_error(
+                    stdout,
+                    Some(id),
+                    &format!("terminal prefix reset failed: {msg}"),
+                    "gpu",
+                    true,
+                    &ep,
+                );
+                drop(guard);
+                return None;
+            }
+            if !repaired {
+                terminal_cache_invalidated = true;
+                pending_seed_committable = false;
+                position = 0;
+            }
+        }
+        if strict_prefix_action == SpecStrictPrefixAction::Realign {
             let plan = spec_prefix_realign_plan(&prompt_tokens, first_token, &raw_decode);
             let compact_offset = slot.kv_cache_mut().map(|kv| kv.compact_offset).unwrap_or(0);
             if let Err(msg) = spec_prefix_realign_admit(
@@ -3885,7 +4864,12 @@ pub fn generate_spec(
     // only the decoded portion (`emitted`), making the next non-dflash turn
     // full-reset because no system/user prefix was present.
     // Host raw/conversation stay exact even when client events were held.
-    m.conversation_tokens = {
+    m.conversation_tokens = if terminal_cache_invalidated {
+        free_checkpoints(&mut m.prefill_checkpoints, gpu);
+        free_checkpoints(&mut m.dflash_checkpoints, gpu);
+        m.asst_turn_cache.clear();
+        Vec::new()
+    } else {
         let mut v = Vec::with_capacity(prompt_tokens.len() + emitted.len());
         v.extend_from_slice(&prompt_tokens);
         v.extend_from_slice(&emitted);
@@ -3948,6 +4932,7 @@ pub fn generate_spec(
         finish,
         grammar_violated,
         semantic_stop,
+        ctx_exhausted,
         fail_closed_rollback,
         prefill_s: t_prefill.duration_since(t0).as_secs_f64(),
         total_s: t_end.duration_since(t0).as_secs_f64(),
@@ -4015,6 +5000,31 @@ pub fn attach_mtp_window_timings(
     }
 }
 
+fn emit_pipeline_cancel_after_rollback(
+    stdout: &mut impl Write,
+    id: &str,
+    completion_tokens: usize,
+    epilogue: &RollbackEpilogue,
+) {
+    if epilogue.rolled_back {
+        crate::ar::emit_generation_cancel(
+            crate::ar::GenerationRoute::PipelineParallel,
+            stdout,
+            id,
+            completion_tokens,
+        );
+    } else {
+        emit_fail_closed_error_for_route(
+            crate::ar::GenerationRoute::PipelineParallel,
+            stdout,
+            Some(id),
+            "client cancelled; fail-closed rollback could not be attested",
+            "validation",
+            false,
+            epilogue,
+        );
+    }
+}
 /// Multi-GPU pipeline-parallel AR decode (Stage 7 of #58). Mirrors the pp=1
 /// `generate` Qwen3.5 branch feature-for-feature: ChatFrame ChatML wrap,
 /// EosFilter UTF-8 streaming + strip-think + stop_at, LoopGuard n-gram
@@ -4024,6 +5034,7 @@ pub fn attach_mtp_window_timings(
 /// `gpus.devices[dev]` and `scratch_set.per_device[dev]`; the final
 /// sample lives on `gpus.output_device`. DFlash, CASK, PFlash, VL and
 /// arch_id < 5 are refused upstream at load.
+
 #[allow(clippy::too_many_arguments)]
 pub fn generate_multi(
     m: &mut LoadedModel,
@@ -4057,8 +5068,9 @@ pub fn generate_multi(
     // byte-identical at temp>0.
     request_seed: u64,
 ) {
-    let tokenizer = m.tokenizer.as_ref().unwrap();
-    let prompt_est = tokenizer.encode(prompt).len() + 20;
+    // Borrow `tokenizer` per-use (never held across whole-`m` calls): the
+    // pre-prefill resets below reborrow `m` through the canonical reset.
+    let prompt_est = m.tokenizer.as_ref().unwrap().encode(prompt).len() + 20;
     if m.seq_pos
         .saturating_add(prompt_est)
         .saturating_add(max_tokens)
@@ -4072,63 +5084,24 @@ pub fn generate_multi(
         m.conversation_tokens.clear();
         free_checkpoints(&mut m.prefill_checkpoints, gpu);
         free_checkpoints(&mut m.dflash_checkpoints, gpu);
-        // qwen35 recurrent state lives in the bundle (ModelState::Qwen35), not
-        // the always-None m.dn_state/m.kv_cache. Inlined (disjoint field access)
-        // because a `&tokenizer` borrow of `m` is live here; covers both the
-        // pp>1 per-LA-device path and the single-GPU path.
-        if m.pp > 1 {
-            if let (Some(b), Some(gpus), Some(la)) = (
-                m.state.as_mut().and_then(|s| {
-                    (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-                }),
-                m.pp_gpus.as_mut(),
-                m.pp_dn_la_to_device.as_ref(),
-            ) {
-                let dn = &b.dn_state;
-                for (i, s) in dn.s_matrices.iter().enumerate() {
-                    let g = &mut gpus.devices[la[i] as usize];
-                    let _ = g.bind_thread();
-                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                for (i, s) in dn.s_scales.iter().enumerate() {
-                    let g = &mut gpus.devices[la[i] as usize];
-                    let _ = g.bind_thread();
-                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                for (i, s) in dn.conv_states.iter().enumerate() {
-                    let g = &mut gpus.devices[la[i] as usize];
-                    let _ = g.bind_thread();
-                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                // multi-GPU currently leaves s_ef_residual empty; loop is a no-op then,
-                // but keeps single-GPU parity if EF is ever wired per-device.
-                for (i, s) in dn.s_ef_residual.iter().enumerate() {
-                    let g = &mut gpus.devices[la[i] as usize];
-                    let _ = g.bind_thread();
-                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                }
-            }
-        } else if let Some(b) = m.state.as_mut().and_then(|s| {
-            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-        }) {
-            let dn = &b.dn_state;
-            for s in &dn.s_matrices {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.s_scales {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.conv_states {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.s_ef_residual {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-        }
-        if let Some(b) = m.state.as_mut().and_then(|s| {
-            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-        }) {
-            b.kv_cache.compact_offset = 0;
+        // Canonical recurrent reset (G4.7 E4): pp-aware, accumulates every
+        // bind/memset error instead of swallowing them. KV compact_offset is
+        // handled inside. On failure fail closed rather than serving over
+        // dirty state (practically unreachable on healthy GPUs).
+        if let Err(e) = crate::common::reset_qwen35_recurrent(m, gpu) {
+            let ep = crate::common::reset_mesh_request_state(m, Some(gpu));
+            let msg = format!("context reset failed: {e}");
+            emit_fail_closed_error_for_route(
+                crate::ar::GenerationRoute::PipelineParallel,
+                stdout,
+                Some(id),
+                &msg,
+                "gpu",
+                true,
+                &ep,
+            );
+            let _ = stdout.flush();
+            return;
         }
         if let Some(ad) = m.kv_adaptive.as_mut() {
             if let Some(b) = m.state.as_mut().and_then(|s| {
@@ -4140,6 +5113,7 @@ pub fn generate_multi(
             }
         }
     }
+    let tokenizer = m.tokenizer.as_ref().unwrap();
 
     let im_end = tokenizer.encode("<|im_end|>");
     let nl = tokenizer.encode("\n");
@@ -4241,7 +5215,10 @@ pub fn generate_multi(
     // Jinja default-ON (flipped 2026-06-09): render through the model's chat
     // template for ALL arches; opt out with HIPFIRE_JINJA_CHAT=0 (hand-rolled
     // ChatML/Plain). Falls back to Plain automatically when no template resolves.
-    let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+    let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
+        .ok()
+        .as_deref()
+        != Some("0");
     // hunt3 H-A: drop the `seq_pos == 0` gate (PR #389 removed it from generate()).
     // With the gate, turn 2+ fell through to the Plain scaffold, dropping the
     // system prompt and the full history replay that render_messages provides.
@@ -4347,71 +5324,36 @@ pub fn generate_multi(
     // re-rendered every turn, so turn 2+ must cold-reset BEFORE the budget guard
     // + prefill — otherwise the full render appends to the prior turn's dirty
     // KV / DeltaNet / checkpoint state (stale recurrent state → drift; the
-    // system prompt was also being silently dropped on turn 2+). Mirrors the
-    // `reset_pp_uncommitted_state!` semantics, written inline because that macro
-    // is defined later (after kv/dn/gpus are borrowed). Same shape as the
-    // context-full reset at the top of this fn and generate()'s `jinja_active &&
-    // seq_pos > 0` block.
+    // system prompt was also being silently dropped on turn 2+). DN/KV core
+    // is the canonical `reset_qwen35_recurrent` (G4.7 E4); the `tokenizer`
+    // rebind below keeps its loan from spanning the whole-`m` call. Same
+    // shape as the context-full reset at the top of this fn and generate()'s
+    // `jinja_active && seq_pos > 0` block.
     if try_jinja && m.seq_pos > 0 {
         m.seq_pos = 0;
         m.conversation_tokens.clear();
         free_checkpoints(&mut m.prefill_checkpoints, gpu);
         free_checkpoints(&mut m.dflash_checkpoints, gpu);
-        // qwen35 recurrent state lives in the bundle (ModelState::Qwen35), not
-        // the always-None m.dn_state/m.kv_cache. Covers pp>1 + single-GPU.
-        if m.pp > 1 {
-            if let (Some(b), Some(gpus), Some(la)) = (
-                m.state.as_mut().and_then(|s| {
-                    (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-                }),
-                m.pp_gpus.as_mut(),
-                m.pp_dn_la_to_device.as_ref(),
-            ) {
-                let dn = &b.dn_state;
-                for (i, s) in dn.s_matrices.iter().enumerate() {
-                    let g = &mut gpus.devices[la[i] as usize];
-                    let _ = g.bind_thread();
-                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                for (i, s) in dn.s_scales.iter().enumerate() {
-                    let g = &mut gpus.devices[la[i] as usize];
-                    let _ = g.bind_thread();
-                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                for (i, s) in dn.conv_states.iter().enumerate() {
-                    let g = &mut gpus.devices[la[i] as usize];
-                    let _ = g.bind_thread();
-                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                // multi-GPU currently leaves s_ef_residual empty; loop is a no-op then,
-                // but keeps single-GPU parity if EF is ever wired per-device.
-                for (i, s) in dn.s_ef_residual.iter().enumerate() {
-                    let g = &mut gpus.devices[la[i] as usize];
-                    let _ = g.bind_thread();
-                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                }
-            }
-        } else if let Some(b) = m.state.as_mut().and_then(|s| {
-            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-        }) {
-            let dn = &b.dn_state;
-            for s in &dn.s_matrices {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.s_scales {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.conv_states {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.s_ef_residual {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-        }
-        if let Some(b) = m.state.as_mut().and_then(|s| {
-            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-        }) {
-            b.kv_cache.compact_offset = 0;
+        // Canonical recurrent reset (G4.7 E4): pp-aware, accumulates every
+        // bind/memset error instead of swallowing them. KV compact_offset is
+        // handled inside. No m-derived loan spans this block (the `tokenizer`
+        // borrow below starts after it), so the whole-`m` call compiles. On
+        // failure fail closed rather than serving over dirty state
+        // (practically unreachable on healthy GPUs).
+        if let Err(e) = crate::common::reset_qwen35_recurrent(m, gpu) {
+            let ep = crate::common::reset_mesh_request_state(m, Some(gpu));
+            let msg = format!("prompt-cache reset failed: {e}");
+            emit_fail_closed_error_for_route(
+                crate::ar::GenerationRoute::PipelineParallel,
+                stdout,
+                Some(id),
+                &msg,
+                "gpu",
+                true,
+                &ep,
+            );
+            let _ = stdout.flush();
+            return;
         }
         if let Some(b) = m.state.as_mut().and_then(|s| {
             (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_llama::LlamaBundle>()
@@ -4419,6 +5361,10 @@ pub fn generate_multi(
             b.kv.compact_offset = 0;
         }
     }
+    // Rebind `tokenizer` past the cold-reset above: the pre-reset borrow
+    // ended at its last use, and this fresh borrow starts after the
+    // whole-`m` canonical reset call, so no loan spans it.
+    let tokenizer = m.tokenizer.as_ref().unwrap();
 
     let trailer = nl.len();
     if m.seq_pos
@@ -4473,44 +5419,6 @@ pub fn generate_multi(
     let kv = &mut b.kv_cache;
     let dn = &mut b.dn_state;
     let gpus = m.pp_gpus.as_mut().unwrap();
-    let dn_la_to_device = m.pp_dn_la_to_device.as_ref().unwrap();
-
-    macro_rules! reset_pp_uncommitted_state {
-        () => {{
-            m.seq_pos = 0;
-            m.conversation_tokens.clear();
-            free_checkpoints(&mut m.prefill_checkpoints, gpu);
-            free_checkpoints(&mut m.dflash_checkpoints, gpu);
-            for (i, s) in dn.s_matrices.iter().enumerate() {
-                let g = &mut gpus.devices[dn_la_to_device[i] as usize];
-                let _ = g.bind_thread();
-                let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for (i, s) in dn.s_scales.iter().enumerate() {
-                let g = &mut gpus.devices[dn_la_to_device[i] as usize];
-                let _ = g.bind_thread();
-                let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for (i, s) in dn.conv_states.iter().enumerate() {
-                let g = &mut gpus.devices[dn_la_to_device[i] as usize];
-                let _ = g.bind_thread();
-                let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            // multi-GPU currently leaves s_ef_residual empty; loop is a no-op then,
-            // but keeps single-GPU parity if EF is ever wired per-device.
-            for (i, s) in dn.s_ef_residual.iter().enumerate() {
-                let g = &mut gpus.devices[dn_la_to_device[i] as usize];
-                let _ = g.bind_thread();
-                let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            kv.compact_offset = 0;
-            if let Some(b) = m.state.as_mut().and_then(|s| {
-                (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_llama::LlamaBundle>()
-            }) {
-                b.kv.compact_offset = 0;
-            }
-        }};
-    }
 
     let dev_last = gpus.output_device;
     let vocab_size = config.vocab_size;
@@ -4528,7 +5436,9 @@ pub fn generate_multi(
     // (m.decoded_vocab) because `m` is already mutably borrowed here (kv/dn/gpus)
     // — pp>1 + tools is uncommon, so the per-request decode is acceptable.
     let grammar_enabled = hipfire_runtime::prompt_frame::qwen35_grammar_on(
-        hipfire_config::developer_var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref(),
+        hipfire_config::developer_var("HIPFIRE_QWEN35_GRAMMAR")
+            .ok()
+            .as_deref(),
         &m.model_path,
     );
     let tool_schemas_qwen: Vec<hipfire_arch_qwen35::grammar::ToolSchema> = if grammar_enabled {
@@ -4573,6 +5483,13 @@ pub fn generate_multi(
     };
     let mut grammar_mask: Vec<bool> = vec![true; grammar_vocab.len()];
 
+    crate::ar::emit_generation_start(
+        crate::ar::GenerationRoute::PipelineParallel,
+        stdout,
+        id,
+        started_in_think,
+    );
+
     if let Err(e) = qwen35::forward_prefill_batch_multi(
         gpus,
         weights,
@@ -4583,28 +5500,47 @@ pub fn generate_multi(
         dn,
         scratch_set,
     ) {
-        // hunt3 M-A: a partial-band prefill failure leaves DeltaNet partially
-        // advanced; without resetting, the next cold turn prefills over dirty
-        // recurrent state (drift). Mirror both abort paths, which already reset.
-        reset_pp_uncommitted_state!();
-        emit_active_attempt_error(
+        // G4.7: attested PP rollback covers every device (DN/KV/host reset +
+        // per-device graph invalidate + per-device sync). Terminal identical
+        // except `rolled_back` is now attested.
+        let ep = crate::common::reset_mesh_request_state(m, Some(gpu));
+        emit_fail_closed_error_for_route(
+            crate::ar::GenerationRoute::PipelineParallel,
             stdout,
             Some(id),
             &format!("forward_prefill_batch_multi: {}", e),
             "validation",
             false,
-            false,
+            &ep,
         );
         let _ = stdout.flush();
         return;
     }
     m.seq_pos += new_tokens.len();
     m.conversation_tokens.extend_from_slice(&new_tokens);
+    // Test-only fault seam (G4.7, mirrors dense G4.10): fires after GPU/KV
+    // mutation, before any token visibility. Armed alongside the
+    // serve-fault-inject hook by `test_fault_after_prefill:true`; the daemon
+    // guard disarms the leftover arm on request end.
+    if crate::common::take_generation_fault_after_prefill() {
+        let ep = crate::common::reset_mesh_request_state(m, Some(gpu));
+        emit_fail_closed_error_for_route(
+            crate::ar::GenerationRoute::PipelineParallel,
+            stdout,
+            Some(id),
+            "injected fault after prefill",
+            "gpu",
+            true,
+            &ep,
+        );
+        return;
+    }
 
     if check_abort(id) {
-        reset_pp_uncommitted_state!();
-        let ep = production_fail_closed_rollback(m, gpu, None, None);
-        emit_spec_cancel_after_rollback(stdout, id, 0, &ep);
+        // G4.9: the mesh dispatcher resets recurrent state and attests
+        // graph invalidation + synchronization on every PP device.
+        let ep = crate::common::reset_mesh_request_state(m, Some(gpu));
+        emit_pipeline_cancel_after_rollback(stdout, id, 0, &ep);
         return;
     }
 
@@ -4683,24 +5619,76 @@ pub fn generate_multi(
     // and runs to max_tokens. Mark the latch position and hard-EOS once
     // generation runs this many tokens past it — generous for a real final
     // answer, bounded against runaway.
-    let post_latch_answer_budget: usize = hipfire_config::developer_var("HIPFIRE_POST_LATCH_ANSWER_TOKENS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(768);
+    let post_latch_answer_budget: usize =
+        hipfire_config::developer_var("HIPFIRE_POST_LATCH_ANSWER_TOKENS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(768);
     let mut latch_gen_mark: Option<usize> = None;
     let loop_guard =
         hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get());
 
     while generated < max_tokens {
         if check_abort(id) {
-            reset_pp_uncommitted_state!();
-            let ep = production_fail_closed_rollback(m, gpu, None, None);
-            emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
+            // G4.9: the mesh dispatcher resets recurrent state and attests
+            // graph invalidation + synchronization on every PP device.
+            let ep = crate::common::reset_mesh_request_state(m, Some(gpu));
+            emit_pipeline_cancel_after_rollback(stdout, id, generated, &ep);
             return;
         }
-        generated += 1;
-        m.conversation_tokens.push(next_token);
-        streamed_tokens.push(next_token);
+        // Commit the sampled token only after its device/KV mutation succeeds.
+        // A forward error therefore cannot publish a token before the
+        // fail-closed terminal. The test seam is deliberately after the real
+        // forward returns successfully, but still before any token visibility.
+        if let Err(e) = publish_after_forward(
+            qwen35::forward_scratch_multi(
+                gpus,
+                weights,
+                config,
+                next_token,
+                m.seq_pos,
+                kv,
+                dn,
+                scratch_set,
+            ),
+            || {
+                m.seq_pos += 1;
+                generated += 1;
+                m.conversation_tokens.push(next_token);
+                streamed_tokens.push(next_token);
+            },
+        ) {
+            // G4.7: attested PP rollback covers every device (DN/KV/host reset +
+            // per-device graph invalidate + per-device sync). Terminal identical
+            // except `rolled_back` is now attested.
+            let ep = crate::common::reset_mesh_request_state(m, Some(gpu));
+            emit_fail_closed_error_for_route(
+                crate::ar::GenerationRoute::PipelineParallel,
+                stdout,
+                Some(id),
+                &format!("forward_scratch_multi decode: {}", e),
+                "validation",
+                false,
+                &ep,
+            );
+            let _ = stdout.flush();
+            return;
+        }
+        // Test-only fault seam (G4.7): fires after the first decode forward's
+        // actual GPU/KV mutation, before any token visibility.
+        if generated == 1 && crate::common::take_generation_fault_after_first_decode() {
+            let ep = crate::common::reset_mesh_request_state(m, Some(gpu));
+            emit_fail_closed_error_for_route(
+                crate::ar::GenerationRoute::PipelineParallel,
+                stdout,
+                Some(id),
+                "injected fault after first decode",
+                "gpu",
+                true,
+                &ep,
+            );
+            return;
+        }
         emit_committed_event(
             stdout,
             id,
@@ -4722,33 +5710,6 @@ pub fn generate_multi(
             );
             let _ = stdout.flush();
         }
-
-        if let Err(e) = qwen35::forward_scratch_multi(
-            gpus,
-            weights,
-            config,
-            next_token,
-            m.seq_pos,
-            kv,
-            dn,
-            scratch_set,
-        ) {
-            // hunt3 M-A: a decode-step failure leaves DeltaNet advanced past the
-            // (un-baked) conversation_tokens; reset so the next cold turn starts
-            // clean. Mirrors both abort paths.
-            reset_pp_uncommitted_state!();
-            emit_active_attempt_error(
-                stdout,
-                Some(id),
-                &format!("forward_scratch_multi decode: {}", e),
-                "validation",
-                false,
-                false,
-            );
-            let _ = stdout.flush();
-            return;
-        }
-        m.seq_pos += 1;
 
         if next_token == config.eos_token {
             break;
@@ -4773,7 +5734,6 @@ pub fn generate_multi(
                 break;
             }
         }
-
         // max_think_tokens / force-answer enforcement: same decoded-text scan
         // as pp=1, but all recurrent-state writes route through *_multi.
         let force_answer_now = check_force_answer(id);
@@ -4839,21 +5799,36 @@ pub fn generate_multi(
                 let budget_left = max_tokens.saturating_sub(generated);
                 let take = close_tokens.len().min(budget_left);
                 for &t in &close_tokens[..take] {
-                    if let Err(e) = qwen35::forward_scratch_multi(
-                        gpus,
-                        weights,
-                        config,
-                        t,
-                        m.seq_pos,
-                        kv,
-                        dn,
-                        scratch_set,
+                    if let Err(e) = publish_after_forward(
+                        qwen35::forward_scratch_multi(
+                            gpus,
+                            weights,
+                            config,
+                            t,
+                            m.seq_pos,
+                            kv,
+                            dn,
+                            scratch_set,
+                        ),
+                        || {
+                            m.seq_pos += 1;
+                            m.conversation_tokens.push(t);
+                            streamed_tokens.push(t);
+                        },
                     ) {
-                        eprintln!("[daemon] max_think close forward_scratch_multi: {}", e);
-                        break;
+                        let ep = crate::common::reset_mesh_request_state(m, Some(gpu));
+                        emit_fail_closed_error_for_route(
+                            crate::ar::GenerationRoute::PipelineParallel,
+                            stdout,
+                            Some(id),
+                            &format!("max_think close forward_scratch_multi: {}", e),
+                            "validation",
+                            false,
+                            &ep,
+                        );
+                        let _ = stdout.flush();
+                        return;
                     }
-                    m.seq_pos += 1;
-                    m.conversation_tokens.push(t);
                     // hunt3 M-C: keep the grammar matcher in sync over force-closed
                     // </think> tokens, exactly as generate() does (~8591). Without
                     // this a tools request that force-closes <think> leaves the
@@ -4861,7 +5836,6 @@ pub fn generate_multi(
                     if grammar_active {
                         grammar_matcher.advance(&tokenizer.decode(&[t]));
                     }
-                    streamed_tokens.push(t);
                     emit_committed_event(
                         stdout,
                         id,
@@ -4996,8 +5970,36 @@ pub fn generate_multi(
                 .saturating_add(nl.len());
             if nudge_len > 0 && need_kv <= m.physical_cap {
                 for &tok in &nudge_tokens[..nudge_len] {
-                    m.conversation_tokens.push(tok);
-                    streamed_tokens.push(tok);
+                    if let Err(e) = publish_after_forward(
+                        qwen35::forward_scratch_multi(
+                            gpus,
+                            weights,
+                            config,
+                            tok,
+                            m.seq_pos,
+                            kv,
+                            dn,
+                            scratch_set,
+                        ),
+                        || {
+                            m.seq_pos += 1;
+                            m.conversation_tokens.push(tok);
+                            streamed_tokens.push(tok);
+                        },
+                    ) {
+                        let ep = crate::common::reset_mesh_request_state(m, Some(gpu));
+                        emit_fail_closed_error_for_route(
+                            crate::ar::GenerationRoute::PipelineParallel,
+                            stdout,
+                            Some(id),
+                            &format!("budget_alert forward_scratch_multi: {}", e),
+                            "validation",
+                            false,
+                            &ep,
+                        );
+                        let _ = stdout.flush();
+                        return;
+                    }
                     emit_committed_event(
                         stdout,
                         id,
@@ -5019,20 +6021,6 @@ pub fn generate_multi(
                         );
                         let _ = stdout.flush();
                     }
-                    if let Err(e) = qwen35::forward_scratch_multi(
-                        gpus,
-                        weights,
-                        config,
-                        tok,
-                        m.seq_pos,
-                        kv,
-                        dn,
-                        scratch_set,
-                    ) {
-                        eprintln!("[daemon] budget_alert forward_scratch_multi: {}", e);
-                        break;
-                    }
-                    m.seq_pos += 1;
                     generated += 1;
                 }
             } else if nudge_len < nudge_tokens.len() {
@@ -5124,21 +6112,35 @@ pub fn generate_multi(
     // ChatML \n trailer so the next turn opens cleanly.
     if im_end_token == Some(*m.conversation_tokens.last().unwrap_or(&0)) && !nl.is_empty() {
         for &t in &nl {
-            if let Err(e) = qwen35::forward_scratch_multi(
-                gpus,
-                weights,
-                config,
-                t,
-                m.seq_pos,
-                kv,
-                dn,
-                scratch_set,
+            if let Err(e) = publish_after_forward(
+                qwen35::forward_scratch_multi(
+                    gpus,
+                    weights,
+                    config,
+                    t,
+                    m.seq_pos,
+                    kv,
+                    dn,
+                    scratch_set,
+                ),
+                || {
+                    m.seq_pos += 1;
+                    m.conversation_tokens.push(t);
+                },
             ) {
-                eprintln!("[daemon] trailer forward_scratch_multi: {}", e);
-                break;
+                let ep = crate::common::reset_mesh_request_state(m, Some(gpu));
+                emit_fail_closed_error_for_route(
+                    crate::ar::GenerationRoute::PipelineParallel,
+                    stdout,
+                    Some(id),
+                    &format!("trailer forward_scratch_multi: {}", e),
+                    "validation",
+                    false,
+                    &ep,
+                );
+                let _ = stdout.flush();
+                return;
             }
-            m.seq_pos += 1;
-            m.conversation_tokens.push(t);
         }
     }
 
@@ -5178,12 +6180,82 @@ pub fn generate_multi(
     });
     let decision = await_client_terminal_commit(stdout, id, &pending_done);
     if decision != ClientTerminalDecision::Commit {
-        reset_pp_uncommitted_state!();
-        let ep = production_fail_closed_rollback(m, gpu, None, None);
-        emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
+        // G4.9: the mesh dispatcher resets recurrent state and attests graph
+        // invalidation + synchronization on every PP device.
+        let ep = crate::common::reset_mesh_request_state(m, Some(gpu));
+        emit_pipeline_cancel_after_rollback(stdout, id, generated, &ep);
         return;
     }
-    emit_staged_terminal_done(stdout, &pending_done);
+    crate::ar::emit_generation_done_value(
+        crate::ar::GenerationRoute::PipelineParallel,
+        stdout,
+        &pending_done,
+    );
+}
+/// Mesh-carrier entry point for the existing pipeline-parallel Qwen route.
+///
+/// G4.9 deliberately keeps the proven `generate_multi` loop and its wire
+/// behavior. This named carrier is the lifecycle boundary used by dispatch;
+/// all reset/terminal ownership remains in the existing route implementation.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_mesh_carrier(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    pflash_state: Option<&mut hipfire_pflash::pflash::PflashState>,
+    pflash_cfg: Option<&hipfire_pflash::pflash::PflashConfig>,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    top_k: Option<u32>,
+    min_p: Option<f32>,
+    max_tokens: usize,
+    repeat_penalty: f32,
+    repeat_window: usize,
+    presence_penalty: f32,
+    frequency_penalty: f32,
+    budget_alert_at_tok: usize,
+    budget_alert_text: &str,
+    max_think_tokens: usize,
+    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    stop: &[String],
+    reasoning_effort: Option<&str>,
+    enable_thinking: bool,
+    request_seed: u64,
+) {
+    generate_multi(
+        m,
+        gpu,
+        pflash_state,
+        pflash_cfg,
+        stdout,
+        id,
+        prompt,
+        system_prompt,
+        temp,
+        top_p,
+        top_k,
+        min_p,
+        max_tokens,
+        repeat_penalty,
+        repeat_window,
+        presence_penalty,
+        frequency_penalty,
+        budget_alert_at_tok,
+        budget_alert_text,
+        max_think_tokens,
+        assistant_prefix,
+        tools,
+        messages_history,
+        stop,
+        reasoning_effort,
+        enable_thinking,
+        request_seed,
+    );
 }
 
 // --- Auto-appended shared helpers (shared-temp, dedup at merge) ---
@@ -5552,6 +6624,30 @@ pub fn spec_should_flush_pending_seed(
     pending_seed_committable: bool,
 ) -> bool {
     !grammar_violated && pending_seed_committable
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SpecStrictPrefixAction {
+    None,
+    Realign,
+    RepairForTerminal,
+}
+
+/// Decide how to repair target and drafter state after observing only a strict
+/// prefix of a speculative window. Terminal requests prefer a window-local
+/// rollback; speculators without that capability fall back to a full reset.
+pub fn spec_strict_prefix_action(
+    consumed: usize,
+    committed: usize,
+    terminal: bool,
+) -> SpecStrictPrefixAction {
+    if consumed >= committed {
+        SpecStrictPrefixAction::None
+    } else if terminal {
+        SpecStrictPrefixAction::RepairForTerminal
+    } else {
+        SpecStrictPrefixAction::Realign
+    }
 }
 
 pub fn spec_prefix_realign_plan(
@@ -6310,3 +7406,141 @@ mod deepseek4_reasoning_prefix_tests {
 }
 
 // --- iter appended ---
+
+#[cfg(test)]
+mod ep_serve_target_tests {
+    use super::{ep_serve_target, EpServeTarget};
+
+    #[test]
+    fn known_ep_archs_keep_their_servers_but_all_others_refuse() {
+        // Adjacent supported: DS4, MiniMax and Qwen3.5-MoE keep their servers.
+        // (A dense-TP load refines 5|6 to `Qwen35DenseTp` via its `EpArch` in
+        // `generate_ep`; arch_id alone defaults to the MoE server so MoE
+        // never enters the dense-TP server.)
+        assert_eq!(ep_serve_target(9), EpServeTarget::Deepseek4);
+        assert_eq!(ep_serve_target(10), EpServeTarget::Minimax);
+        assert_eq!(ep_serve_target(5), EpServeTarget::Qwen35Moe);
+        assert_eq!(ep_serve_target(6), EpServeTarget::Qwen35Moe);
+        // No EpArch exists for these: explicit refusal naming the arch,
+        // never the old wrong-server DS4 fallthrough.
+        assert_eq!(ep_serve_target(11), EpServeTarget::UnsupportedArch(11));
+        assert_eq!(ep_serve_target(12), EpServeTarget::UnsupportedArch(12));
+        assert_eq!(ep_serve_target(13), EpServeTarget::UnsupportedArch(13));
+        assert_eq!(ep_serve_target(0), EpServeTarget::UnsupportedArch(0));
+    }
+}
+
+#[cfg(test)]
+mod qwen_lookup_primer_tests {
+    use super::qwen_jinja_lookup_turn;
+    use crate::common::{asst_turn_fingerprint, normalize_asst_turn_for_fingerprint};
+    use hipfire_loader::AsstTurnCache;
+
+    fn assistant_msg(content: &str) -> hipfire_runtime::prompt_frame::Message {
+        hipfire_runtime::prompt_frame::Message {
+            role: hipfire_runtime::prompt_frame::Role::Assistant,
+            content: content.to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        }
+    }
+
+    fn insert(
+        cache: &mut AsstTurnCache,
+        content: &str,
+        turn: hipfire_runtime::prompt_frame::CachedAssistantTurn,
+    ) {
+        let fp = asst_turn_fingerprint(&normalize_asst_turn_for_fingerprint(content), &[]);
+        cache.insert(fp, turn);
+    }
+
+    fn body(ids: &[u32]) -> hipfire_runtime::prompt_frame::CachedAssistantBody {
+        hipfire_runtime::prompt_frame::CachedAssistantBody {
+            token_ids: ids.to_vec(),
+            text: String::new(),
+        }
+    }
+
+    #[test]
+    fn span_turn_replays_verbatim_while_full_body_gets_primer() {
+        let mut cache = AsstTurnCache::new_from_env();
+        // Whole-envelope turn: text-only reasoning marker + verbatim full body;
+        // the template re-emits every marker, so no primer allowed.
+        insert(
+            &mut cache,
+            "answer B ",
+            hipfire_runtime::prompt_frame::CachedAssistantTurn {
+                reasoning: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
+                    token_ids: Vec::new(),
+                    text: "plan A\n".to_string(),
+                }),
+                tools: Vec::new(),
+                content: Some(body(&[1, 2, 3])),
+            },
+        );
+        // Full turn (no reasoning): primer prepended for bare-history replay.
+        insert(
+            &mut cache,
+            "plain answer",
+            hipfire_runtime::prompt_frame::CachedAssistantTurn {
+                reasoning: None,
+                tools: Vec::new(),
+                content: Some(body(&[7, 8])),
+            },
+        );
+        let span = qwen_jinja_lookup_turn(&mut cache, &assistant_msg("answer B "), &[90, 91])
+            .expect("span hit");
+        assert_eq!(
+            span.content.expect("content").token_ids,
+            vec![1, 2, 3],
+            "envelope bodies must not gain the primer (duplicates the think opener)"
+        );
+        let rb = span.reasoning.expect("reasoning marker");
+        assert!(
+            rb.token_ids.is_empty(),
+            "reasoning marker carries text only"
+        );
+        assert_eq!(rb.text, "plan A\n");
+        let full = qwen_jinja_lookup_turn(&mut cache, &assistant_msg("plain answer"), &[90, 91])
+            .expect("full hit");
+        assert_eq!(
+            full.content.expect("content").token_ids,
+            vec![90, 91, 7, 8],
+            "primer-less full bodies must regain the primer"
+        );
+        assert!(full.reasoning.is_none());
+        assert!(qwen_jinja_lookup_turn(&mut cache, &assistant_msg("missing"), &[90]).is_none());
+    }
+}
+#[cfg(test)]
+mod pp_forward_order_tests {
+    use super::publish_after_forward;
+
+    #[test]
+    fn failed_forward_publishes_neither_token_nor_done() {
+        let mut events = Vec::new();
+        let result = publish_after_forward::<&str>(Err("injected"), || {
+            events.push("token");
+            events.push("done");
+        });
+
+        assert_eq!(result, Err("injected"));
+        assert!(
+            events.is_empty(),
+            "a failed forward must not publish token or done: {events:?}"
+        );
+    }
+
+    #[test]
+    fn successful_forward_publishes_once_after_mutation() {
+        let mut events = Vec::new();
+        let result = publish_after_forward::<&str>(Ok(()), || events.push("token"));
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(events, vec!["token"]);
+    }
+}
