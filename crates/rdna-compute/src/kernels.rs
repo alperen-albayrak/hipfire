@@ -5030,6 +5030,12 @@ pub const ADD_SRC: &str = include_str!("../../../kernels/src/add.hip");
 /// Element-wise in-place add: a[i] += b[i]
 pub const ADD_INPLACE_SRC: &str = include_str!("../../../kernels/src/add_inplace.hip");
 
+/// Symmetric direct-peer-read allreduce residual add:
+/// `x[i] = x[i] + (p_first[i] + p_second[i])`, one partial P2P-mapped.
+/// See `kernels/src/add_peer_residual_f32.hip` for the rank-order contract.
+pub const ADD_PEER_RESIDUAL_SRC: &str =
+    include_str!("../../../kernels/src/add_peer_residual_f32.hip");
+
 /// Scaled in-place add: y[i] += c * x[i] — one kernel for both
 /// CPU-scalar (c via kernarg) and GPU-scalar (c via device buffer)
 /// variants. Used in the MoE FFN accumulator to fuse the old
@@ -5473,6 +5479,29 @@ pub const ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SRC: &str =
 /// the gfx12-specific WMMA builtin/output mapping.
 pub const ATTENTION_Q8_0_FLASH_PREFILL_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/attention_q8_0_flash_prefill_wmma.gfx12.hip");
+
+/// gfx1201-only GQA-fused FA2 prefill (research opt-in). One workgroup per
+/// KV head x 8 positions; K/V dequantized once per KT64 tile into 64 KiB
+/// swizzled LDS. Three symbols: `attention_q8_0_fa2_gqa_gfx1201` (direct),
+/// `attention_q8_0_fa2_gqa_partial_gfx1201` (split-KV records, stride 258),
+/// `attention_q8_0_fa2_gqa_merge_gfx1201` (stable LSE merge). JIT-only via
+/// the `attention_q8_0_fa2_gqa_gfx1201*` launchers; never on a default path.
+pub const ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip");
+
+/// fwht3-K variant of [`ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC`] (`HIPFIRE_FA2_KMODE=3):
+/// K dequantizes fwht3 records (f32 cnorm + 96 B of 3-bit codes, K stored
+/// FWHT-rotated) into the unchanged K plane, and the entry symbol
+/// `attention_q8_0_fa2_gqa_fwht3k_gfx1201` rotates this WG's Q rows in place
+/// (signed FWHT-256) before the shared body. `turbo_common.h` is prepended
+/// (same pattern as the `KV_SLOT_DESC_H` sites) because the runtime compile
+/// has no `-I` to `kernels/src`. JIT-only via
+/// `attention_q8_0_fa2_gqa_fwht3k_gfx1201`; never on a default path.
+pub const ATTENTION_Q8_0_FA2_GQA_FWHT3K_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_FA2_KMODE 3\n",
+    include_str!("../../../kernels/src/turbo_common.h"),
+    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip")
+);
 
 /// Benchmark-only gfx1201 LongSpec partition WMMA flash: same arithmetic as
 /// `ATTENTION_Q8_0_FLASH_PREFILL_WMMA_GFX12_SRC` but writes retained online-
