@@ -35,6 +35,10 @@ pub struct FeatureFlags {
     /// the accepted DeepSeek4 MQ2R route default while retaining portable
     /// behavior for other models and architectures.
     pub gfx1151_e8_buffer: Option<bool>,
+    /// gfx11 MMQ per-128 (X128) activation path (`HIPFIRE_GFX11_MMQ_X128`).
+    /// Default on gfx1100/gfx1151 (WT2 KLD +0.000186 <= +0.0005 gate passed);
+    /// `=0` restores the per-32 MMQ route. Other arches stay per-32.
+    pub gfx11_mmq_x128: Option<bool>,
 
     // ── Quant / format toggles ────────────────────────────────────
     pub hfq3_dp4a: Option<bool>,
@@ -429,6 +433,7 @@ impl FeatureFlags {
             gemv_dp4a_default_on: is_gfx906,
             gemv_dp4a: parse_bool("HIPFIRE_GEMV_DP4A"),
             gfx1151_e8_buffer: parse_bool("HIPFIRE_GFX1151_E8_BUFFER"),
+            gfx11_mmq_x128: parse_bool("HIPFIRE_GFX11_MMQ_X128"),
             gemv_prefetch: parse_bool("HIPFIRE_GEMV_PREFETCH"),
             gemv_prefetch_default_on: is_gfx906,
             gfx942_lds_gemv: parse_bool("HIPFIRE_GFX942_LDS_GEMV"),
@@ -675,6 +680,13 @@ impl FeatureFlags {
             .unwrap_or(self.gfx942_lds_gemv_default_on)
     }
 
+    /// Resolved gfx11 MMQ X128 route: env override, else default on
+    /// gfx1100/gfx1151, per-32 elsewhere.
+    pub fn gfx11_mmq_x128_enabled(&self) -> bool {
+        self.gfx11_mmq_x128
+            .unwrap_or(matches!(self.arch.as_str(), "gfx1100" | "gfx1151"))
+    }
+
     pub fn hfq3_mmq_layer_gate_pass(&self) -> bool {
         let lo = self.hfq3_mmq_layer_min;
         let hi = self.hfq3_mmq_layer_max;
@@ -734,6 +746,7 @@ impl FeatureFlags {
             gemv_dp4a_default_on: is_gfx906,
             gemv_dp4a: None,
             gfx1151_e8_buffer: None,
+            gfx11_mmq_x128: None,
             gemv_prefetch: None,
             gemv_prefetch_default_on: is_gfx906,
             gfx942_lds_gemv: None,

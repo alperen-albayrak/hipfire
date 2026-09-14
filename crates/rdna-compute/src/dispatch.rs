@@ -2739,6 +2739,35 @@ impl Gpu {
             k,
         )
     }
+    /// Ensure prefill activations are quantized at per-128 granularity
+    /// (X128 prelude for the `HIPFIRE_GFX11_MMQ_X128` opt-in path).
+    /// See `scratch.rs::ensure_q8_1_mmq_x128`.
+    pub fn ensure_q8_1_mmq_x128(
+        &mut self,
+        x: &GpuTensor,
+        batch_size: usize,
+        k: usize,
+    ) -> HipResult<*mut c_void> {
+        // bind_thread: skip — delegated to scratch.rs
+        let capture_mode = self.graphs.capture_mode;
+        let force_blob = self.flags.force_blob_path;
+        self.scratch.ensure_q8_1_mmq_x128(
+            &self.hip,
+            &mut self.compiler,
+            &mut self.modules,
+            &mut self.functions,
+            self.active_stream.as_ref(),
+            &mut self.graphs.capture_blobs,
+            capture_mode,
+            force_blob,
+            &mut self.replay,
+            self.device_id,
+            x,
+            batch_size,
+            k,
+        )
+    }
+
     /// Returns the number of launches recorded by the `ReplayController`.
     /// Together with `self.graphs.capture_blobs.len()`, this must agree for
     /// any body — see the `Gpu` type-level invariant doc.

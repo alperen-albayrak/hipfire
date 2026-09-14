@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- gfx11 MMQ per-128 (X128) activation path is now the default on gfx1100/gfx1151 (`HIPFIRE_GFX11_MMQ_X128=0` restores the per-32 route; other arches stay per-32). The X128 prelude quantizes activations per 128-K half and the consumer accumulates each half in one i32 WMMA tile with a single float correction. WT2 KLD gate passed on XTX: 0.058189 -> 0.058375 (+0.000186 <= +0.0005); greedy HumanEval `below_zero` output is bit-identical off/on on both GPUs. Measured on Qwen3.8-27B XT: XTX pp512 990 -> 1141 tok/s (+15%), pp2048 927 -> 1059 (+14%), full_set 1017 -> 864 us/call, full_add 1151 -> 956 us/call; Halo pp512 377 -> 438 (+16%), pp2048 354 -> 407 (+15%); decode tok/s unchanged. Serve battery on XTX with defaults: 5/5 turns finish=stop, 0 runaway/empty/attractor.
+
 ## v0.3.1 — DFlash cache repair, admission hardening, image gen
 
 - Sealed MoE execution contracts (#755, fivetide; G5 constituent): manifest-derived expert plans bound transactionally to Qwen3.6-A3B / Ornith and Cohere MoE decode and prefill; raw MoE escape hatches removed; rank-local sealed EP with root-authoritative routes and owned reduction leases, verified on 4× R9700. EP cross-route logit equivalence is diagnostic, not an acceptance gate — G5 acceptance and PM4 admission remain open on #666.

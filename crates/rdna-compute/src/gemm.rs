@@ -18044,6 +18044,25 @@ impl Gpu {
         result
     }
 
+    /// Flag-aware MMQ activation prelude for the MQ4V2 family: per-128
+    /// X128 by default on gfx1100/gfx1151 (`HIPFIRE_GFX11_MMQ_X128=0`
+    /// restores per-32 Q8_1).
+    /// `gemm_mq4g256v2_mmq_prequant` reads the same flag for the consumer,
+    /// so prelude and consumer always agree. Confined to the V2 flag path;
+    /// tail routing is untouched.
+    fn ensure_q8_1_mmq_x_v2(
+        &mut self,
+        x: &GpuTensor,
+        batch_size: usize,
+        k: usize,
+    ) -> HipResult<*mut c_void> {
+        if self.flags.gfx11_mmq_x128_enabled() {
+            self.ensure_q8_1_mmq_x128(x, batch_size, k)
+        } else {
+            self.ensure_q8_1_mmq_x(x, batch_size, k)
+        }
+    }
+
     fn gemm_mq4g256v2_mmq_prequant(
         &mut self,
         a_raw: &GpuTensor,
@@ -18068,10 +18087,17 @@ impl Gpu {
         }
         self.bind_thread()?;
         let full = m % 128 == 0 && batch_size % 128 == 0;
-        let kernel_name = match (full, add) {
-            (true, true) => "gemm_mq4g256v2_residual_mmq_full_add",
-            (true, false) => "gemm_mq4g256v2_residual_mmq_full_set",
-            (false, _) => "gemm_mq4g256v2_residual_mmq",
+        // X128 default on gfx1100/gfx1151 (`HIPFIRE_GFX11_MMQ_X128=0`
+        // restores per-32): same module, x128 consumer entries over the
+        // x128 prelude.
+        let x128 = self.flags.gfx11_mmq_x128_enabled();
+        let kernel_name = match (full, add, x128) {
+            (true, true, false) => "gemm_mq4g256v2_residual_mmq_full_add",
+            (true, false, false) => "gemm_mq4g256v2_residual_mmq_full_set",
+            (false, _, false) => "gemm_mq4g256v2_residual_mmq",
+            (true, true, true) => "gemm_mq4g256v2_residual_mmq_full_add_x128",
+            (true, false, true) => "gemm_mq4g256v2_residual_mmq_full_set_x128",
+            (false, _, true) => "gemm_mq4g256v2_residual_mmq_x128",
         };
         const MODULE: &str = "gemm_mq4g256v2_residual_mmq";
         self.ensure_kernel(
@@ -27435,7 +27461,7 @@ impl Gpu {
             && batch_size >= 128
             && batch_size % 128 == 0
         {
-            let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+            let xq = self.ensure_q8_1_mmq_x_v2(x, batch_size, k)?;
             self.gemm_mq4g256v2_mmq_set_prequant(a_qkv, xq, y_qkv, qkv_m, k, batch_size)?;
             self.gemm_mq4g256v2_mmq_set_prequant(a_z, xq, y_z, z_m, k, batch_size)?;
             self.gemm_mq4g256v2_mmq_set_prequant(a_beta, xq, y_beta, beta_m, k, batch_size)?;
@@ -27924,7 +27950,7 @@ impl Gpu {
             && batch_size >= 128
             && batch_size % 128 == 0
         {
-            let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+            let xq = self.ensure_q8_1_mmq_x_v2(x, batch_size, k)?;
             self.gemm_mq4g256v2_mmq_set_prequant(a_q, xq, y_q, q_m, k, batch_size)?;
             self.gemm_mq4g256v2_mmq_set_prequant(a_k, xq, y_k, k_m, k, batch_size)?;
             self.gemm_mq4g256v2_mmq_set_prequant(a_v, xq, y_v, v_m, k, batch_size)?;
@@ -28561,7 +28587,7 @@ impl Gpu {
             && batch_size >= 128
             && batch_size % 128 == 0
         {
-            let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+            let xq = self.ensure_q8_1_mmq_x_v2(x, batch_size, k)?;
             self.gemm_mq4g256v2_mmq_set_prequant(a_gate, xq, y_gate, gate_m, k, batch_size)?;
             self.gemm_mq4g256v2_mmq_set_prequant(a_up, xq, y_up, up_m, k, batch_size)?;
             return Ok(());
@@ -29168,7 +29194,7 @@ impl Gpu {
             && batch_size >= 128
             && batch_size % 128 == 0
         {
-            let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+            let xq = self.ensure_q8_1_mmq_x_v2(x, batch_size, k)?;
             self.gemm_mq4g256v2_mmq_add_prequant(a_raw, xq, y, m, k, batch_size)?;
             return Ok(());
         }
