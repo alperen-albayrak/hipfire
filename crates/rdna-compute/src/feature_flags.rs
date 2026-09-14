@@ -214,6 +214,16 @@ pub struct FeatureFlags {
     /// FP8-WMMA MQ4v2 3-way QKV (full-attention) prefill candidate. Default ON
     /// on exact gfx1201; `=0` opts out.
     pub gfx12_mq4v2_fp8_qkv: bool,
+    /// `HIPFIRE_GFX12_FA2_PREFILL=0` opts out of the gfx1201 GQA-fused FA2
+    /// prefill attention candidate (Qwen NH24/NKV4/HD256, eager HIP only).
+    /// Default ON on exact gfx1201; `=1` forces it on other arches
+    /// (launchers stay gfx1201-only).
+    pub gfx12_fa2_prefill: bool,
+    /// `HIPFIRE_GFX11_FA2_PREFILL=0` opts out of the gfx11 GQA-fused FA2
+    /// prefill attention candidate (Qwen NH24/NKV4/HD256, eager HIP only).
+    /// Default ON on gfx1100/gfx1151; `=1` forces it on other arches
+    /// (launchers stay on the gfx11 allowlist).
+    pub gfx11_fa2_prefill: bool,
     pub gemm_dump: bool,
     pub deterministic: bool,
     pub mw16: bool,
@@ -574,6 +584,10 @@ impl FeatureFlags {
                 .unwrap_or(arch == "gfx1201"),
             gfx12_mq4v2_fp8_qkv: parse_bool("HIPFIRE_GFX12_MQ4V2_FP8_QKV")
                 .unwrap_or(arch == "gfx1201"),
+            gfx12_fa2_prefill: parse_bool("HIPFIRE_GFX12_FA2_PREFILL")
+                .unwrap_or(arch == "gfx1201"),
+            gfx11_fa2_prefill: parse_bool("HIPFIRE_GFX11_FA2_PREFILL")
+                .unwrap_or(matches!(arch, "gfx1100" | "gfx1151")),
             gemm_dump: value("HIPFIRE_GEMM_DUMP").ok().as_deref() == Some("1"),
             deterministic: value("HIPFIRE_DETERMINISTIC").ok().as_deref() == Some("1"),
             mw16: value("HIPFIRE_MW16").map_or(false, |v| v == "1"),
@@ -848,6 +862,8 @@ impl FeatureFlags {
             gfx12_mq4v2_fp8_resid: false,
             gfx12_mq4v2_fp8_qkvza: false,
             gfx12_mq4v2_fp8_qkv: false,
+            gfx12_fa2_prefill: false,
+            gfx11_fa2_prefill: false,
             gemm_dump: false,
             deterministic: false,
             mw16: false,
@@ -955,6 +971,50 @@ mod tests {
         assert!(!test_flags.gfx12_mq4v2_fp8_resid);
         assert!(!test_flags.gfx12_mq4v2_fp8_qkvza);
         assert!(!test_flags.gfx12_mq4v2_fp8_qkv);
+    }
+
+    #[test]
+    fn fa2_prefill_defaults_on_certified_arches_with_opt_out() {
+        // Default process policy: gfx12 FA2 admits on exact gfx1201, gfx11
+        // FA2 on gfx1100/gfx1151; explicit `=0` restores the incumbent.
+        let resolved = resolve([]).unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        let gfx1201 = FeatureFlags::from_process_config("gfx1201", &process);
+        assert!(gfx1201.gfx12_fa2_prefill);
+        assert!(!gfx1201.gfx11_fa2_prefill);
+        for arch in ["gfx1100", "gfx1151"] {
+            let flags = FeatureFlags::from_process_config(arch, &process);
+            assert!(!flags.gfx12_fa2_prefill, "arch={arch}");
+            assert!(flags.gfx11_fa2_prefill, "arch={arch}");
+        }
+        for arch in ["gfx1101", "gfx1102", "gfx1150", "gfx1200", "gfx942"] {
+            let flags = FeatureFlags::from_process_config(arch, &process);
+            assert!(!flags.gfx12_fa2_prefill, "arch={arch}");
+            assert!(!flags.gfx11_fa2_prefill, "arch={arch}");
+        }
+
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("kernel.gfx12_fa2_prefill", "false").unwrap();
+        layer.set_cli("kernel.gfx11_fa2_prefill", "false").unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: "config.toml".into(),
+            },
+            layer,
+        }])
+        .unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        let opted_out_12 = FeatureFlags::from_process_config("gfx1201", &process);
+        assert!(!opted_out_12.gfx12_fa2_prefill);
+        let opted_out_11 = FeatureFlags::from_process_config("gfx1100", &process);
+        assert!(!opted_out_11.gfx11_fa2_prefill);
+
+        // The unit-test constructor stays fully off (deterministic baseline).
+        for arch in ["gfx1201", "gfx1100", "gfx1151"] {
+            let test_flags = FeatureFlags::for_test(arch);
+            assert!(!test_flags.gfx12_fa2_prefill, "arch={arch}");
+            assert!(!test_flags.gfx11_fa2_prefill, "arch={arch}");
+        }
     }
 
     #[test]
