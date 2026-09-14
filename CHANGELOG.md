@@ -13,6 +13,7 @@
   ~3e-4 vs CPU f64. In-model pp512: XTX 993.5 -> 1018.6 tok/s (+2.5%), Halo
   377.2 -> 383.4 (+1.6%); a/b rows 96x~283 us -> 96x~36 us; greedy md5
   bit-identical before/after on both GPUs.
+- gfx1201 FP8-WMMA MQ4v2 prefill is now the default (opt-out): `HIPFIRE_GFX12_MQ4V2_FP8_{GATEUP,RESID,QKVZA,QKV}` default ON on exact gfx1201 (`=0` on any one restores the F16 route), the two-slab S2BT8 symbols are the default (`HIPFIRE_GFX12_MQ4V2_FP8_SLABS=1` selects single-slab), and the admitted path sizes the prefill chunk at 512 instead of 384. Measured on Qwen3.8-27B XT (`qwen3.8-27b.mq4-xt`, GPU 0): pp512 1387 vs 841 tok/s opt-out, pp2048 1218 vs 812 tok/s, tg1@128 unchanged (~36.5 tok/s). Quality delta is nil on the evidence run: greedy (`-t 0 -n 1200`, `benchmarks/prompts/humaneval_3_below_zero.txt`) is byte-identical between the default FP8 path and the all-flags-`=0` F16 path, and the serve battery reports 5/5 coherent turns (runaway=0 empty=0 attractor=0).
 
 ## v0.3.1 — DFlash cache repair, admission hardening, image gen
 
