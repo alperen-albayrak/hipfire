@@ -2121,6 +2121,24 @@ pub static FIELDS: &[ConfigField] = &[
         "Enable the gfx1201 MQ4v2 FP8 WMMA 3-way QKV prefill route (default on exact gfx1201; set to false or HIPFIRE_GFX12_MQ4V2_FP8_QKV=0 to opt out)."
     ),
     process_bool_field!(
+        "kernel.gfx12_fa2_prefill",
+        "gfx12_fa2_prefill",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_GFX12_FA2_PREFILL",
+        "Enable the gfx1201 GQA-fused FA2 prefill attention route (default on exact gfx1201; set to false or HIPFIRE_GFX12_FA2_PREFILL=0 to opt out)."
+    ),
+    process_bool_field!(
+        "kernel.gfx11_fa2_prefill",
+        "gfx11_fa2_prefill",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_GFX11_FA2_PREFILL",
+        "Enable the gfx11 GQA-fused FA2 prefill attention route (default on gfx1100/gfx1151; set to false or HIPFIRE_GFX11_FA2_PREFILL=0 to opt out)."
+    ),
+    process_bool_field!(
         "kernel.dot2_gemv",
         "dot2_gemv",
         Kernel,

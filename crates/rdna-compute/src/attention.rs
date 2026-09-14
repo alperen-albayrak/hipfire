@@ -3235,14 +3235,12 @@ impl Gpu {
         max_ctx_len: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        // Research opt-in: gfx1201 GQA-fused FA2 prefill. Exact arch/shape/
+        // Default-on: gfx1201 GQA-fused FA2 prefill. Exact arch/shape/
         // eager gates; everything else falls through to the byte-identical
         // incumbent path below. Never inside `_wmma_slots` (its all-or-none
         // slot ABI is unchanged) and never under replay/graph capture.
-        if hipfire_config::developer_var("HIPFIRE_GFX12_FA2_PREFILL")
-            .ok()
-            .as_deref()
-            == Some("1")
+        // Opt out with `HIPFIRE_GFX12_FA2_PREFILL=0`.
+        if self.flags.gfx12_fa2_prefill
             && self.arch == "gfx1201"
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
@@ -3258,15 +3256,12 @@ impl Gpu {
                 max_ctx_len, batch_size,
             );
         }
-        // Research opt-in: gfx11 (RDNA3) GQA-fused FA2 prefill. Exact
+        // Default-on: gfx11 (RDNA3) GQA-fused FA2 prefill. Exact
         // arch/shape/eager gates; everything else falls through to the
         // byte-identical incumbent path below. Arch-disjoint from the
         // gfx1201 arm above (gfx11 allowlist only); the two flags are
-        // independent.
-        if hipfire_config::developer_var("HIPFIRE_GFX11_FA2_PREFILL")
-            .ok()
-            .as_deref()
-            == Some("1")
+        // independent. Opt out with `HIPFIRE_GFX11_FA2_PREFILL=0`.
+        if self.flags.gfx11_fa2_prefill
             && matches!(
                 self.arch.as_str(),
                 "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"

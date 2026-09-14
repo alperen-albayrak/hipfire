@@ -1610,18 +1610,15 @@ fn dispatch_attend(
                         .as_deref(),
                     Some("0") | Some("off") | Some("false")
                 );
-                // gfx1201 FA2 prefill with fwht3 K (research opt-in,
-                // HIPFIRE_GFX12_FA2_PREFILL=1). K stays in the fwht3 layout
+                // gfx1201 FA2 prefill with fwht3 K (default on;
+                // `HIPFIRE_GFX12_FA2_PREFILL=0` opts out). K stays in the fwht3 layout
                 // (100 B/head); the kernel rotates this WG's Q rows in place
                 // and dequantizes fwht3 K into its K plane, V unchanged Q8.
                 // Same shape/eager predicates as the Q8 FA2 ingress, plus:
                 // no tree-verify (FA2 has no tree path) and V must be Q8_0
                 // (v_mode 8 — lloyd V lives in rotated space FA2 never
                 // inverts). Falls through to the incumbent below otherwise.
-                if hipfire_config::developer_var("HIPFIRE_GFX12_FA2_PREFILL")
-                    .ok()
-                    .as_deref()
-                    == Some("1")
+                if gpu.flags.gfx12_fa2_prefill
                     && gpu.arch == "gfx1201"
                     && !gpu.replay.is_recording()
                     && !gpu.graphs.capture_mode
@@ -1650,15 +1647,12 @@ fn dispatch_attend(
                     ))?;
                     return Ok(());
                 }
-                // gfx11 FA2 prefill with fwht3 K (research opt-in,
-                // HIPFIRE_GFX11_FA2_PREFILL=1). Same contract and predicates
+                // gfx11 FA2 prefill with fwht3 K (default on;
+                // `HIPFIRE_GFX11_FA2_PREFILL=0` opts out). Same contract and predicates
                 // as the gfx1201 arm above; arch-disjoint (gfx11 allowlist
                 // only) and an independent flag. Falls through to the
                 // incumbent below otherwise.
-                if hipfire_config::developer_var("HIPFIRE_GFX11_FA2_PREFILL")
-                    .ok()
-                    .as_deref()
-                    == Some("1")
+                if gpu.flags.gfx11_fa2_prefill
                     && matches!(
                         gpu.arch.as_str(),
                         "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"
