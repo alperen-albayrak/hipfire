@@ -167,6 +167,41 @@ fn dflash_gemm_q8_lmhead(
     Ok(())
 }
 
+/// Shared MQ{2,3,4,5,6}G256V2 batched lm_head launcher used by the five
+/// draft/verify call sites below. Keeps a single 5-way match so each new
+/// speculative path does not re-list the five direct MQ-v2 batched-lmhead
+/// Gpu entry points.
+#[inline]
+fn gemm_mq_batched_lmhead(
+    gpu: &mut Gpu,
+    dtype: rdna_compute::DType,
+    w_buf: &GpuTensor,
+    rotated: &GpuTensor,
+    logits: &GpuTensor,
+    m: usize,
+    k: usize,
+    batch: usize,
+) -> HipResult<()> {
+    match dtype {
+        rdna_compute::DType::MQ4G256V2 => {
+            gpu.gemm_mq4g256v2_batched_lmhead(w_buf, rotated, logits, m, k, batch)
+        }
+        rdna_compute::DType::MQ6G256V2 => {
+            gpu.gemm_mq6g256v2_batched_lmhead(w_buf, rotated, logits, m, k, batch)
+        }
+        rdna_compute::DType::MQ5G256V2 => {
+            gpu.gemm_mq5g256v2_batched_lmhead(w_buf, rotated, logits, m, k, batch)
+        }
+        rdna_compute::DType::MQ3G256V2 => {
+            gpu.gemm_mq3g256v2_batched_lmhead(w_buf, rotated, logits, m, k, batch)
+        }
+        rdna_compute::DType::MQ2G256V2 => {
+            gpu.gemm_mq2g256v2_batched_lmhead(w_buf, rotated, logits, m, k, batch)
+        }
+        other => unreachable!("gemm_mq_batched_lmhead: unexpected dtype {other:?}"),
+    }
+}
+
 fn dflash_moe_verify_graph_lmhead_enabled_from_env_value(value: Option<&str>) -> bool {
     match value {
         Some(v) => {
@@ -318,88 +353,22 @@ fn dflash_enqueue_verify_lm_head(
                 b,
             )?;
         }
-        rdna_compute::DType::MQ4G256V2 => {
+        rdna_compute::DType::MQ4G256V2
+        | rdna_compute::DType::MQ6G256V2
+        | rdna_compute::DType::MQ5G256V2
+        | rdna_compute::DType::MQ3G256V2
+        | rdna_compute::DType::MQ2G256V2 => {
             assert!(
                 b * w_out.k <= verify_scratch.max_n * verify_scratch.hidden_k,
-                "verify_scratch.rot undersized for MQ4 v2 lm_head: b*k={} > max_n*hidden_k={}",
+                "verify_scratch.rot undersized for MQ v2 lm_head: b*k={} > max_n*hidden_k={}",
                 b * w_out.k,
                 verify_scratch.max_n * verify_scratch.hidden_k
             );
             let rot = verify_scratch.rot.sub_offset(0, b * w_out.k);
             llama::rotate_x_mq_batched_for(gpu, w_out, final_hidden, &rot, w_out.k, b)?;
-            gpu.gemm_mq4g256v2_batched_lmhead(
-                &w_out.buf,
-                &rot,
-                &logits_batch,
-                w_out.m,
-                w_out.k,
-                b,
-            )?;
-        }
-        rdna_compute::DType::MQ6G256V2 => {
-            assert!(
-                b * w_out.k <= verify_scratch.max_n * verify_scratch.hidden_k,
-                "verify_scratch.rot undersized for MQ6V2 lm_head: b*k={} > max_n*hidden_k={}",
-                b * w_out.k,
-                verify_scratch.max_n * verify_scratch.hidden_k
-            );
-            let rot = verify_scratch.rot.sub_offset(0, b * w_out.k);
-            llama::rotate_x_mq_batched_for(gpu, w_out, final_hidden, &rot, w_out.k, b)?;
-            gpu.gemm_mq6g256v2_batched_lmhead(
-                &w_out.buf,
-                &rot,
-                &logits_batch,
-                w_out.m,
-                w_out.k,
-                b,
-            )?;
-        }
-        rdna_compute::DType::MQ5G256V2 => {
-            assert!(
-                b * w_out.k <= verify_scratch.max_n * verify_scratch.hidden_k,
-                "verify_scratch.rot undersized for MQ5V2 lm_head: b*k={} > max_n*hidden_k={}",
-                b * w_out.k,
-                verify_scratch.max_n * verify_scratch.hidden_k
-            );
-            let rot = verify_scratch.rot.sub_offset(0, b * w_out.k);
-            llama::rotate_x_mq_batched_for(gpu, w_out, final_hidden, &rot, w_out.k, b)?;
-            gpu.gemm_mq5g256v2_batched_lmhead(
-                &w_out.buf,
-                &rot,
-                &logits_batch,
-                w_out.m,
-                w_out.k,
-                b,
-            )?;
-        }
-        rdna_compute::DType::MQ3G256V2 => {
-            assert!(
-                b * w_out.k <= verify_scratch.max_n * verify_scratch.hidden_k,
-                "verify_scratch.rot undersized for MQ3V2 lm_head: b*k={} > max_n*hidden_k={}",
-                b * w_out.k,
-                verify_scratch.max_n * verify_scratch.hidden_k
-            );
-            let rot = verify_scratch.rot.sub_offset(0, b * w_out.k);
-            llama::rotate_x_mq_batched_for(gpu, w_out, final_hidden, &rot, w_out.k, b)?;
-            gpu.gemm_mq3g256v2_batched_lmhead(
-                &w_out.buf,
-                &rot,
-                &logits_batch,
-                w_out.m,
-                w_out.k,
-                b,
-            )?;
-        }
-        rdna_compute::DType::MQ2G256V2 => {
-            assert!(
-                b * w_out.k <= verify_scratch.max_n * verify_scratch.hidden_k,
-                "verify_scratch.rot undersized for MQ2V2 lm_head: b*k={} > max_n*hidden_k={}",
-                b * w_out.k,
-                verify_scratch.max_n * verify_scratch.hidden_k
-            );
-            let rot = verify_scratch.rot.sub_offset(0, b * w_out.k);
-            llama::rotate_x_mq_batched_for(gpu, w_out, final_hidden, &rot, w_out.k, b)?;
-            gpu.gemm_mq2g256v2_batched_lmhead(
+            gemm_mq_batched_lmhead(
+                gpu,
+                w_out.gpu_dtype,
                 &w_out.buf,
                 &rot,
                 &logits_batch,
@@ -4287,78 +4256,20 @@ fn draft_dflash_block_rank(
                     batch,
                 )?;
             }
-            rdna_compute::DType::MQ4G256V2 => {
+            rdna_compute::DType::MQ4G256V2
+            | rdna_compute::DType::MQ6G256V2
+            | rdna_compute::DType::MQ5G256V2
+            | rdna_compute::DType::MQ3G256V2
+            | rdna_compute::DType::MQ2G256V2 => {
                 assert!(
                     batch * h <= verify_scratch.max_n * verify_scratch.hidden_k,
-                    "verify_scratch.rot undersized for MQ4 v2 draft lm_head"
+                    "verify_scratch.rot undersized for MQ v2 draft lm_head"
                 );
                 let rotated = verify_scratch.rot.sub_offset(0, batch * h);
                 llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
-                gpu.gemm_mq4g256v2_batched_lmhead(
-                    &w_out.buf,
-                    &rotated,
-                    &logits_batch,
-                    w_out.m,
-                    w_out.k,
-                    batch,
-                )?;
-            }
-            rdna_compute::DType::MQ6G256V2 => {
-                assert!(
-                    batch * h <= verify_scratch.max_n * verify_scratch.hidden_k,
-                    "verify_scratch.rot undersized for MQ6V2 draft lm_head"
-                );
-                let rotated = verify_scratch.rot.sub_offset(0, batch * h);
-                llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
-                gpu.gemm_mq6g256v2_batched_lmhead(
-                    &w_out.buf,
-                    &rotated,
-                    &logits_batch,
-                    w_out.m,
-                    w_out.k,
-                    batch,
-                )?;
-            }
-            rdna_compute::DType::MQ5G256V2 => {
-                assert!(
-                    batch * h <= verify_scratch.max_n * verify_scratch.hidden_k,
-                    "verify_scratch.rot undersized for MQ5V2 draft lm_head"
-                );
-                let rotated = verify_scratch.rot.sub_offset(0, batch * h);
-                llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
-                gpu.gemm_mq5g256v2_batched_lmhead(
-                    &w_out.buf,
-                    &rotated,
-                    &logits_batch,
-                    w_out.m,
-                    w_out.k,
-                    batch,
-                )?;
-            }
-            rdna_compute::DType::MQ3G256V2 => {
-                assert!(
-                    batch * h <= verify_scratch.max_n * verify_scratch.hidden_k,
-                    "verify_scratch.rot undersized for MQ3V2 draft lm_head"
-                );
-                let rotated = verify_scratch.rot.sub_offset(0, batch * h);
-                llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
-                gpu.gemm_mq3g256v2_batched_lmhead(
-                    &w_out.buf,
-                    &rotated,
-                    &logits_batch,
-                    w_out.m,
-                    w_out.k,
-                    batch,
-                )?;
-            }
-            rdna_compute::DType::MQ2G256V2 => {
-                assert!(
-                    batch * h <= verify_scratch.max_n * verify_scratch.hidden_k,
-                    "verify_scratch.rot undersized for MQ2V2 draft lm_head"
-                );
-                let rotated = verify_scratch.rot.sub_offset(0, batch * h);
-                llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
-                gpu.gemm_mq2g256v2_batched_lmhead(
+                gemm_mq_batched_lmhead(
+                    gpu,
+                    w_out.gpu_dtype,
                     &w_out.buf,
                     &rotated,
                     &logits_batch,
@@ -4888,78 +4799,20 @@ pub fn spec_step_dflash(
                         batch,
                     )?;
                 }
-                rdna_compute::DType::MQ4G256V2 => {
+                rdna_compute::DType::MQ4G256V2
+                | rdna_compute::DType::MQ6G256V2
+                | rdna_compute::DType::MQ5G256V2
+                | rdna_compute::DType::MQ3G256V2
+                | rdna_compute::DType::MQ2G256V2 => {
                     assert!(
                         batch * h <= verify_scratch.max_n * verify_scratch.hidden_k,
-                        "verify_scratch.rot undersized for MQ4 v2 draft lm_head"
+                        "verify_scratch.rot undersized for MQ v2 draft lm_head"
                     );
                     let rotated = verify_scratch.rot.sub_offset(0, batch * h);
                     llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
-                    gpu.gemm_mq4g256v2_batched_lmhead(
-                        &w_out.buf,
-                        &rotated,
-                        &logits_batch,
-                        w_out.m,
-                        w_out.k,
-                        batch,
-                    )?;
-                }
-                rdna_compute::DType::MQ6G256V2 => {
-                    assert!(
-                        batch * h <= verify_scratch.max_n * verify_scratch.hidden_k,
-                        "verify_scratch.rot undersized for MQ6V2 draft lm_head"
-                    );
-                    let rotated = verify_scratch.rot.sub_offset(0, batch * h);
-                    llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
-                    gpu.gemm_mq6g256v2_batched_lmhead(
-                        &w_out.buf,
-                        &rotated,
-                        &logits_batch,
-                        w_out.m,
-                        w_out.k,
-                        batch,
-                    )?;
-                }
-                rdna_compute::DType::MQ5G256V2 => {
-                    assert!(
-                        batch * h <= verify_scratch.max_n * verify_scratch.hidden_k,
-                        "verify_scratch.rot undersized for MQ5V2 draft lm_head"
-                    );
-                    let rotated = verify_scratch.rot.sub_offset(0, batch * h);
-                    llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
-                    gpu.gemm_mq5g256v2_batched_lmhead(
-                        &w_out.buf,
-                        &rotated,
-                        &logits_batch,
-                        w_out.m,
-                        w_out.k,
-                        batch,
-                    )?;
-                }
-                rdna_compute::DType::MQ3G256V2 => {
-                    assert!(
-                        batch * h <= verify_scratch.max_n * verify_scratch.hidden_k,
-                        "verify_scratch.rot undersized for MQ3V2 draft lm_head"
-                    );
-                    let rotated = verify_scratch.rot.sub_offset(0, batch * h);
-                    llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
-                    gpu.gemm_mq3g256v2_batched_lmhead(
-                        &w_out.buf,
-                        &rotated,
-                        &logits_batch,
-                        w_out.m,
-                        w_out.k,
-                        batch,
-                    )?;
-                }
-                rdna_compute::DType::MQ2G256V2 => {
-                    assert!(
-                        batch * h <= verify_scratch.max_n * verify_scratch.hidden_k,
-                        "verify_scratch.rot undersized for MQ2V2 draft lm_head"
-                    );
-                    let rotated = verify_scratch.rot.sub_offset(0, batch * h);
-                    llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
-                    gpu.gemm_mq2g256v2_batched_lmhead(
+                    gemm_mq_batched_lmhead(
+                        gpu,
+                        w_out.gpu_dtype,
                         &w_out.buf,
                         &rotated,
                         &logits_batch,
@@ -6853,7 +6706,11 @@ fn run_dflash_draft_for_logits(
             let _ = gpu.free_tensor(rotated);
             r2
         }
-        rdna_compute::DType::MQ4G256V2 => {
+        rdna_compute::DType::MQ4G256V2
+        | rdna_compute::DType::MQ6G256V2
+        | rdna_compute::DType::MQ5G256V2
+        | rdna_compute::DType::MQ3G256V2
+        | rdna_compute::DType::MQ2G256V2 => {
             let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
             let r1 = llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
             if let Err(e) = r1 {
@@ -6861,7 +6718,9 @@ fn run_dflash_draft_for_logits(
                 let _ = gpu.free_tensor(logits_batch);
                 return Err(e);
             }
-            let r2 = gpu.gemm_mq4g256v2_batched_lmhead(
+            let r2 = gemm_mq_batched_lmhead(
+                gpu,
+                w_out.gpu_dtype,
                 &w_out.buf,
                 &rotated,
                 &logits_batch,
@@ -6869,54 +6728,6 @@ fn run_dflash_draft_for_logits(
                 w_out.k,
                 batch,
             );
-            let _ = gpu.free_tensor(rotated);
-            r2
-        }
-        rdna_compute::DType::MQ6G256V2 => {
-            let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
-            let r1 = llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
-            if let Err(e) = r1 {
-                let _ = gpu.free_tensor(rotated);
-                let _ = gpu.free_tensor(logits_batch);
-                return Err(e);
-            }
-            let r2 = gpu.gemm_mq6g256v2_batched_lmhead(&w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch);
-            let _ = gpu.free_tensor(rotated);
-            r2
-        }
-        rdna_compute::DType::MQ5G256V2 => {
-            let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
-            let r1 = llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
-            if let Err(e) = r1 {
-                let _ = gpu.free_tensor(rotated);
-                let _ = gpu.free_tensor(logits_batch);
-                return Err(e);
-            }
-            let r2 = gpu.gemm_mq5g256v2_batched_lmhead(&w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch);
-            let _ = gpu.free_tensor(rotated);
-            r2
-        }
-        rdna_compute::DType::MQ3G256V2 => {
-            let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
-            let r1 = llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
-            if let Err(e) = r1 {
-                let _ = gpu.free_tensor(rotated);
-                let _ = gpu.free_tensor(logits_batch);
-                return Err(e);
-            }
-            let r2 = gpu.gemm_mq3g256v2_batched_lmhead(&w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch);
-            let _ = gpu.free_tensor(rotated);
-            r2
-        }
-        rdna_compute::DType::MQ2G256V2 => {
-            let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
-            let r1 = llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
-            if let Err(e) = r1 {
-                let _ = gpu.free_tensor(rotated);
-                let _ = gpu.free_tensor(logits_batch);
-                return Err(e);
-            }
-            let r2 = gpu.gemm_mq2g256v2_batched_lmhead(&w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch);
             let _ = gpu.free_tensor(rotated);
             r2
         }
@@ -7248,7 +7059,11 @@ fn run_dflash_draft_for_topk_gpu(
             let _ = gpu.free_tensor(rotated);
             r2
         }
-        rdna_compute::DType::MQ4G256V2 => {
+        rdna_compute::DType::MQ4G256V2
+        | rdna_compute::DType::MQ6G256V2
+        | rdna_compute::DType::MQ5G256V2
+        | rdna_compute::DType::MQ3G256V2
+        | rdna_compute::DType::MQ2G256V2 => {
             let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
             let r1 = llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
             if let Err(e) = r1 {
@@ -7256,7 +7071,9 @@ fn run_dflash_draft_for_topk_gpu(
                 let _ = gpu.free_tensor(logits_batch);
                 return Err(e);
             }
-            let r2 = gpu.gemm_mq4g256v2_batched_lmhead(
+            let r2 = gemm_mq_batched_lmhead(
+                gpu,
+                w_out.gpu_dtype,
                 &w_out.buf,
                 &rotated,
                 &logits_batch,
@@ -7264,54 +7081,6 @@ fn run_dflash_draft_for_topk_gpu(
                 w_out.k,
                 batch,
             );
-            let _ = gpu.free_tensor(rotated);
-            r2
-        }
-        rdna_compute::DType::MQ6G256V2 => {
-            let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
-            let r1 = llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
-            if let Err(e) = r1 {
-                let _ = gpu.free_tensor(rotated);
-                let _ = gpu.free_tensor(logits_batch);
-                return Err(e);
-            }
-            let r2 = gpu.gemm_mq6g256v2_batched_lmhead(&w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch);
-            let _ = gpu.free_tensor(rotated);
-            r2
-        }
-        rdna_compute::DType::MQ5G256V2 => {
-            let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
-            let r1 = llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
-            if let Err(e) = r1 {
-                let _ = gpu.free_tensor(rotated);
-                let _ = gpu.free_tensor(logits_batch);
-                return Err(e);
-            }
-            let r2 = gpu.gemm_mq5g256v2_batched_lmhead(&w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch);
-            let _ = gpu.free_tensor(rotated);
-            r2
-        }
-        rdna_compute::DType::MQ3G256V2 => {
-            let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
-            let r1 = llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
-            if let Err(e) = r1 {
-                let _ = gpu.free_tensor(rotated);
-                let _ = gpu.free_tensor(logits_batch);
-                return Err(e);
-            }
-            let r2 = gpu.gemm_mq3g256v2_batched_lmhead(&w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch);
-            let _ = gpu.free_tensor(rotated);
-            r2
-        }
-        rdna_compute::DType::MQ2G256V2 => {
-            let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
-            let r1 = llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
-            if let Err(e) = r1 {
-                let _ = gpu.free_tensor(rotated);
-                let _ = gpu.free_tensor(logits_batch);
-                return Err(e);
-            }
-            let r2 = gpu.gemm_mq2g256v2_batched_lmhead(&w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch);
             let _ = gpu.free_tensor(rotated);
             r2
         }
