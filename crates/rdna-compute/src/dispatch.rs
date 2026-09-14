@@ -1350,6 +1350,12 @@ impl Gpu {
                 fp8_x_source_ptr: std::ptr::null_mut(),
                 q8_1_mmq_x_scratch: None,
                 q8_1_mmq_x_scratch_bytes: 0,
+                mq4v2_fp8_x_scratch: None,
+                mq4v2_fp8_x_scratch_bytes: 0,
+                mq4v2_fp8_half_sums_scratch: None,
+                mq4v2_fp8_half_sums_scratch_bytes: 0,
+                mq4v2_fp8_row_scales_scratch: None,
+                mq4v2_fp8_row_scales_scratch_bytes: 0,
                 ksplit_det_partials: None,
                 ksplit_det_partials_bytes: 0,
                 sample_partials: None,
@@ -2708,6 +2714,70 @@ impl Gpu {
             &mut self.replay,
             x,
             n_elems,
+        )
+    }
+
+    /// Prepare MQ4v2 FP8 activation scratch from `x`: F32 inputs pack directly
+    /// via `pack_f32_to_fp8_mq4v2_gfx12` (single F32->E4M3 rounding; see the
+    /// kernel comment for the accepted last-ulp note vs the F16 path's double
+    /// rounding); non-F32 inputs keep the canonical-F16 + `pack_f16_to_fp8`
+    /// route. Always overwrites the dedicated X8 / half-sum / row-scale
+    /// buffers. Eager-only research entry — rejects graph capture and replay
+    /// recording before any conversion or launch (candidate is not on the
+    /// capture ABI).
+    ///
+    /// Pointers in the returned [`crate::scratch::Mq4v2Fp8Prepared`] belong to
+    /// this `Gpu` and remain valid only until the next call or teardown.
+    pub fn prepare_mq4v2_fp8_x(
+        &mut self,
+        x: &GpuTensor,
+        n: usize,
+        k: usize,
+        scale_mode: i32,
+    ) -> HipResult<crate::scratch::Mq4v2Fp8Prepared> {
+        if self.replay.is_recording() || self.graphs.capture_mode {
+            return Err(HipError::new(
+                0,
+                "prepare_mq4v2_fp8_x: eager-only (capture/replay rejected)",
+            ));
+        }
+        let capture_mode = self.graphs.capture_mode;
+        let force_blob = self.flags.force_blob_path;
+        if x.dtype == crate::DType::F32 {
+            return self.scratch.prepare_mq4v2_fp8_x_f32(
+                &self.hip,
+                &mut self.compiler,
+                &mut self.modules,
+                &mut self.functions,
+                self.active_stream.as_ref(),
+                &mut self.graphs.capture_blobs,
+                capture_mode,
+                force_blob,
+                &mut self.replay,
+                x.buf.as_ptr(),
+                n,
+                k,
+                scale_mode,
+            );
+        }
+        let n_elems = n
+            .checked_mul(k)
+            .ok_or_else(|| HipError::new(0, "prepare_mq4v2_fp8_x: n*k overflow"))?;
+        let x_f16 = self.ensure_fp16_x(x, n_elems)?;
+        self.scratch.prepare_mq4v2_fp8_x(
+            &self.hip,
+            &mut self.compiler,
+            &mut self.modules,
+            &mut self.functions,
+            self.active_stream.as_ref(),
+            &mut self.graphs.capture_blobs,
+            capture_mode,
+            force_blob,
+            &mut self.replay,
+            x_f16,
+            n,
+            k,
+            scale_mode,
         )
     }
 
