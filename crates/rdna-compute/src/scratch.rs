@@ -1106,6 +1106,94 @@ impl ScratchState {
         Ok(self.q8_1_mmq_x_scratch.as_ref().unwrap().as_ptr())
     }
 
+    /// Ensure prefill activations are quantized at per-128 granularity
+    /// (`quantize_q8_1_mmq_ds4_x128`: one (d, s) per 128-K half replicated
+    /// to all ds4 slots). Same 144 B block layout and [K/128, batch] order
+    /// as [`Self::ensure_q8_1_mmq_x`], same scratch buffer — the consumer
+    /// side (`gemm_mq4g256v2_mmq_prequant`) reads the same
+    /// `HIPFIRE_GFX11_MMQ_X128` flag, so prelude and consumer always agree.
+    /// Always launches.
+    pub fn ensure_q8_1_mmq_x128(
+        &mut self,
+        hip: &HipRuntime,
+        compiler: &mut crate::compiler::KernelCompiler,
+        modules: &mut HashMap<String, Module>,
+        functions: &mut HashMap<String, Function>,
+        stream: Option<&Stream>,
+        capture_blobs: &mut Vec<Vec<u8>>,
+        capture_mode: bool,
+        force_blob_path: bool,
+        replay: &mut crate::replay::ReplayController,
+        device_id: i32,
+        x: &GpuTensor,
+        batch_size: usize,
+        k: usize,
+    ) -> HipResult<*mut c_void> {
+        crate::graph::bind_thread(hip, device_id)?;
+        compile_and_load_kernel(
+            compiler,
+            hip,
+            modules,
+            functions,
+            "gemm_mq4g256v2_residual_mmq",
+            kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_SRC,
+            "quantize_q8_1_mmq_ds4_x128",
+        )?;
+
+        let blocks_k = (k + 127) / 128;
+        let block_q8_1_mmq_bytes = 144usize;
+        let needed = blocks_k * batch_size * block_q8_1_mmq_bytes;
+        grow_scratch_buffer(
+            hip,
+            &mut self.q8_1_mmq_x_scratch,
+            &mut self.q8_1_mmq_x_scratch_bytes,
+            needed,
+        )?;
+
+        let src_ptr = x.buf.as_ptr();
+        let must_convert = true;
+        if must_convert {
+            let out_ptr = self.q8_1_mmq_x_scratch.as_ref().unwrap().as_ptr();
+            let mut xp = src_ptr;
+            let mut yp = out_ptr;
+            let mut k_val = k as i32;
+            let mut n_val = batch_size as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &mut xp as *mut _ as *mut c_void,
+                &mut yp as *mut _ as *mut c_void,
+                &mut k_val as *mut _ as *mut c_void,
+                &mut n_val as *mut _ as *mut c_void,
+            ];
+            let grid_x = ((k + 1023) / 1024) as u32;
+            let grid_y = batch_size as u32;
+            launch_maybe_blob(
+                hip,
+                Some(&*compiler),
+                functions,
+                stream,
+                capture_blobs,
+                capture_mode,
+                force_blob_path,
+                Some(replay),
+                "quantize_q8_1_mmq_ds4_x128",
+                [grid_x, grid_y, 1],
+                [256, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = KernargBlob::new();
+                    b.push_ptr(src_ptr);
+                    b.push_ptr(out_ptr);
+                    b.push_i32(k_val);
+                    b.push_i32(n_val);
+                    b
+                },
+            )?;
+        }
+
+        Ok(self.q8_1_mmq_x_scratch.as_ref().unwrap().as_ptr())
+    }
+
     /// Invalidate the FP16/FP8 activation scratch caches. Must be called
     /// whenever the scratch buffer used by MagnumQuant rotation is
     /// written — the scratch pointer is stable but the DATA changes per
