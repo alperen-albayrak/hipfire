@@ -3,6 +3,14 @@
 ## Unreleased
 
 - gfx11 MMQ per-128 (X128) activation path is now the default on gfx1100/gfx1151 (`HIPFIRE_GFX11_MMQ_X128=0` restores the per-32 route; other arches stay per-32). The X128 prelude quantizes activations per 128-K half and the consumer accumulates each half in one i32 WMMA tile with a single float correction. WT2 KLD gate passed on XTX: 0.058189 -> 0.058375 (+0.000186 <= +0.0005); greedy HumanEval `below_zero` output is bit-identical off/on on both GPUs. Measured on Qwen3.8-27B XT: XTX pp512 990 -> 1141 tok/s (+15%), pp2048 927 -> 1059 (+14%), full_set 1017 -> 864 us/call, full_add 1151 -> 956 us/call; Halo pp512 377 -> 438 (+16%), pp2048 354 -> 407 (+15%); decode tok/s unchanged. Serve battery on XTX with defaults: 5/5 turns finish=stop, 0 runaway/empty/attractor.
+- gfx11 MQ4V2 prefill: route the GDN beta/alpha tails (M=48, K=5120) in
+  `gemm_qkvza_mq4g256v2_wmma` off the MMQ base kernel to the unified MW4 f16
+  kernel via a zeroed-Y SET wrapper (`gemm_mq4g256v2_small_tail_set`).
+  Throwaway-measured at (48, 5120, N in 128..512), ABBA x3: MW4 wins every
+  cell (Halo 38..50 us vs MMQ 284; XTX 61..90 us vs MMQ 373..458) at relL2
+  ~3e-4 vs CPU f64. In-model pp512: XTX 993.5 -> 1018.6 tok/s (+2.5%), Halo
+  377.2 -> 383.4 (+1.6%); a/b rows 96x~283 us -> 96x~36 us; greedy md5
+  bit-identical before/after on both GPUs.
 
 ## v0.3.1 — DFlash cache repair, admission hardening, image gen
 

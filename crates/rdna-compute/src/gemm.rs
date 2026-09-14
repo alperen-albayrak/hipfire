@@ -27428,6 +27428,51 @@ impl Gpu {
         ))
     }
     #[allow(unused_variables)]
+    /// Slice-B small-M tail route (SET semantics) for the qkvza MMQ fast path.
+    ///
+    /// The MMQ base kernel (`m % 128 != 0`) wastes most of its 128-row tile on
+    /// GDN beta/alpha (M=48: 283 us/call, 0.89 TFLOPS at N=512). The f16
+    /// residual MW family is ADD-semantics, so Y is zeroed first (one memset
+    /// over batch*m fp32, ~100 KiB at N=512), then the measured-best tail
+    /// kernel runs. Measured at (M=48, K=5120) on gfx1100 (XTX) and gfx1151
+    /// (Halo), N in {128,256,384,512}, 3 warmups/30 calls ABBA x3 fresh
+    /// processes: unified MW4 (`gemm_mqv2_residual_wmma_gfx11_mw_lds`, bits=4,
+    /// waves=4) wins every cell — Halo 38..50 us vs MMQ 284, XTX 61..90 us vs
+    /// MMQ 373..458 — at relL2 ~3e-4 vs CPU f64 (gate 1e-3). MW8/BT4/base
+    /// trail (57/159/97 us Halo; 73..85/202..206/99..103 us XTX); whole-op
+    /// fused BT is slower than the MMQ split (Halo 4978 vs 4300 us, XTX 1988
+    /// vs 2235 us — qkv/z dominate), so only the tails move. MW4 on gfx1151
+    /// is off the big-M residual policy (`mqv2_mw_waves` stays gfx1100-only:
+    /// neutral/negative there at large M) but parity-clean in the small-M
+    /// regime; the big-M policy is untouched. Unreachable safety net: MMQ set
+    /// (SET ignores the zeroed Y).
+    fn gemm_mq4g256v2_small_tail_set(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        xq: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        if m == 0 || batch_size == 0 {
+            return Ok(());
+        }
+        match self.active_stream.as_ref() {
+            Some(stream) => self
+                .hip
+                .memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
+            None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
+        }
+        if self
+            .gemm_mqv2_residual_wmma_gfx11_mw_lds(4, 4, a, x, y, m, k, batch_size)
+            .is_ok()
+        {
+            return Ok(());
+        }
+        self.gemm_mq4g256v2_mmq_set_prequant(a, xq, y, m, k, batch_size)
+    }
     /// MQ4 v2 (qt 44) — gfx11 (RDNA3/3.5) qkvza WMMA.
     /// Sister of `gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2` but with gfx11
     /// WMMA contracts (half16, w32, interleaved C). Distinct source/symbol/module
@@ -27464,8 +27509,23 @@ impl Gpu {
             let xq = self.ensure_q8_1_mmq_x_v2(x, batch_size, k)?;
             self.gemm_mq4g256v2_mmq_set_prequant(a_qkv, xq, y_qkv, qkv_m, k, batch_size)?;
             self.gemm_mq4g256v2_mmq_set_prequant(a_z, xq, y_z, z_m, k, batch_size)?;
-            self.gemm_mq4g256v2_mmq_set_prequant(a_beta, xq, y_beta, beta_m, k, batch_size)?;
-            self.gemm_mq4g256v2_mmq_set_prequant(a_alpha, xq, y_alpha, alpha_m, k, batch_size)?;
+            // GDN beta/alpha tails (M=48 < 128): the MMQ base kernel wastes
+            // ~2/3 of its 128-row tile (283 us at N=512); route to the
+            // measured-best small-M tail kernel (SET semantics).
+            if beta_m < 128 {
+                self.gemm_mq4g256v2_small_tail_set(
+                    a_beta, x, xq, y_beta, beta_m, k, batch_size,
+                )?;
+            } else {
+                self.gemm_mq4g256v2_mmq_set_prequant(a_beta, xq, y_beta, beta_m, k, batch_size)?;
+            }
+            if alpha_m < 128 {
+                self.gemm_mq4g256v2_small_tail_set(
+                    a_alpha, x, xq, y_alpha, alpha_m, k, batch_size,
+                )?;
+            } else {
+                self.gemm_mq4g256v2_mmq_set_prequant(a_alpha, xq, y_alpha, alpha_m, k, batch_size)?;
+            }
             return Ok(());
         }
         // Production MQ4V2 weight-reuse tiles (gfx1100/gfx1151). Capture/replay
