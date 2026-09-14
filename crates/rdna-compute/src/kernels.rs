@@ -5502,6 +5502,32 @@ pub const ATTENTION_Q8_0_FA2_GQA_FWHT3K_GFX1201_SRC: &str = concat!(
     include_str!("../../../kernels/src/turbo_common.h"),
     include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip")
 );
+/// gfx11 (RDNA3) sister of [`ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC`]
+/// (research opt-in). One workgroup per KV head x 8 positions; K/V
+/// dequantized once per KT32 tile into two swizzled f16 LDS planes
+/// (32,768 B dynamic LDS, two resident workgroups per CU). Direct only:
+/// `attention_q8_0_fa2_gqa_gfx11` — no partial/merge symbols. wave32
+/// half16 WMMA with the measured lane-pair mapping (lanes r and r+16
+/// supply identical rows; QK even/odd key ownership, xor-16 pair
+/// reductions, full-P reconstruction, PV even/odd dimension ownership).
+/// JIT-only via the `attention_q8_0_fa2_gqa_gfx11*` launchers; never on a
+/// default path.
+pub const ATTENTION_Q8_0_FA2_GQA_GFX11_SRC: &str =
+    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx11.hip");
+
+/// fwht3-K variant of [`ATTENTION_Q8_0_FA2_GQA_GFX11_SRC`] (`HIPFIRE_FA2_KMODE=3`):
+/// K dequantizes fwht3 records (f32 cnorm + 96 B of 3-bit codes, K stored
+/// FWHT-rotated) into the unchanged K plane, and the entry symbol
+/// `attention_q8_0_fa2_gqa_fwht3k_gfx11` rotates this WG's Q rows in place
+/// (signed FWHT-256) before the shared body. `turbo_common.h` is prepended
+/// (same pattern as the `KV_SLOT_DESC_H` sites) because the runtime compile
+/// has no `-I` to `kernels/src`. JIT-only via
+/// `attention_q8_0_fa2_gqa_fwht3k_gfx11`; never on a default path.
+pub const ATTENTION_Q8_0_FA2_GQA_FWHT3K_GFX11_SRC: &str = concat!(
+    "#define HIPFIRE_FA2_KMODE 3\n",
+    include_str!("../../../kernels/src/turbo_common.h"),
+    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx11.hip")
+);
 
 /// Benchmark-only gfx1201 LongSpec partition WMMA flash: same arithmetic as
 /// `ATTENTION_Q8_0_FLASH_PREFILL_WMMA_GFX12_SRC` but writes retained online-

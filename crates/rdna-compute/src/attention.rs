@@ -3258,6 +3258,33 @@ impl Gpu {
                 max_ctx_len, batch_size,
             );
         }
+        // Research opt-in: gfx11 (RDNA3) GQA-fused FA2 prefill. Exact
+        // arch/shape/eager gates; everything else falls through to the
+        // byte-identical incumbent path below. Arch-disjoint from the
+        // gfx1201 arm above (gfx11 allowlist only); the two flags are
+        // independent.
+        if hipfire_config::developer_var("HIPFIRE_GFX11_FA2_PREFILL")
+            .ok()
+            .as_deref()
+            == Some("1")
+            && matches!(
+                self.arch.as_str(),
+                "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"
+            )
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+            && n_heads == 24
+            && n_kv_heads == 4
+            && head_dim == 256
+            && (64..=512).contains(&batch_size)
+            && batch_size % 16 == 0
+            && (64..=32768).contains(&max_ctx_len)
+        {
+            return self.attention_q8_0_fa2_gqa_gfx11(
+                q, k_cache, v_cache, out, positions, n_heads, n_kv_heads, head_dim,
+                max_ctx_len, batch_size,
+            );
+        }
         self.attention_q8_0_flash_prefill_wmma_slots(
             q, k_cache, v_cache, out, positions, n_heads, n_kv_heads, head_dim, max_ctx_len,
             batch_size, None, None, None, None,
@@ -3794,6 +3821,335 @@ impl Gpu {
             [grid_x, 4, 1],
             [128, 1, 1],
             65536,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q_ptr);
+                b.push_ptr(k_ptr);
+                b.push_ptr(v_ptr);
+                b.push_ptr(out_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_ptr(s1_ptr);
+                b.push_ptr(s2_ptr);
+                b.push_i32(nh);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(bs);
+                b.push_f32(sc);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+    /// gfx11 (RDNA3) GQA-fused FA2 prefill, direct (research opt-in).
+    ///
+    /// Exact H24/KV4/D256, single-slot Q8 K/V, full causal, eager only.
+    /// Grid `[ceil(batch/8), 4, 1]`, block 128 (three 16-row compute waves
+    /// + one helper), dynamic LDS exactly 32,768 B (KT32: two swizzled f16
+    /// planes, two resident workgroups per CU). Production ingress is the
+    /// opt-in branch in [`Self::attention_q8_0_flash_prefill_wmma`]; call
+    /// this directly only from the throwaway oracle/bench harness.
+    /// `max_ctx_len` is max(positions)+1; the kernel never reads it
+    /// (causal bounds come from `positions[]`); it exists only for profile
+    /// byte attribution, mirroring the incumbent.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_q8_0_fa2_gqa_gfx11(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !matches!(
+            self.arch.as_str(),
+            "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"
+        ) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_gfx11 requires a gfx11 arch, got {}",
+                    self.arch
+                ),
+            ));
+        }
+        if n_heads != 24 || n_kv_heads != 4 || head_dim != 256 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_gfx11 requires H24/KV4/D256, got \
+                     H{n_heads}/KV{n_kv_heads}/D{head_dim}"
+                ),
+            ));
+        }
+        if batch_size == 0 || batch_size > 512 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_gfx11 requires 1 <= batch <= 512, got {batch_size}"
+                ),
+            ));
+        }
+        if max_ctx_len == 0 || max_ctx_len > 32768 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_gfx11 requires 1 <= max_ctx_len <= 32768, got {max_ctx_len}"
+                ),
+            ));
+        }
+        let need_qo = batch_size * n_heads * head_dim;
+        if q.numel() < need_qo || out.numel() < need_qo || positions.numel() < batch_size {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_gfx11 capacity mismatch: \
+                     q={} out={} positions={} (need qo>={need_qo}, pos>={batch_size})",
+                    q.numel(),
+                    out.numel(),
+                    positions.numel()
+                ),
+            ));
+        }
+        const SYMBOL: &str = "attention_q8_0_fa2_gqa_gfx11";
+        // KT32 pinned: the KT64/KT32 ABBA experiment selected KT32
+        // (32,768 B dynamic LDS, two resident WGs/CU) on both measured
+        // archs for both K modes; the KT64 path was removed.
+        if !self.functions.contains_key(SYMBOL) {
+            let src = format!(
+                "#define HIPFIRE_FA2_KT 32\n{}",
+                kernels::ATTENTION_Q8_0_FA2_GQA_GFX11_SRC
+            );
+            self.ensure_kernel(SYMBOL, &src, SYMBOL)?;
+        }
+        let grid_x = batch_size.div_ceil(8) as u32;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut q_ptr = q.buf.as_ptr();
+        let mut k_ptr = k_cache.buf.as_ptr();
+        let mut v_ptr = v_cache.buf.as_ptr();
+        let mut out_ptr = out.buf.as_ptr();
+        let mut pos_ptr = positions.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut bs = batch_size as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q_ptr as *mut _ as *mut c_void,
+            &mut k_ptr as *mut _ as *mut c_void,
+            &mut v_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        // Profile bytes: same analytical upper bound as the incumbent
+        // (f32 Q + K/V re-read over the causal prefix + f32 out); timing
+        // itself remains exact HIP-event timing.
+        let bytes = crate::profile::attention_q8_0_flash_prefill_bytes(
+            batch_size, n_heads, n_kv_heads, head_dim, max_ctx_len,
+        );
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "attention",
+            "attention_q8_0_fa2_gqa_gfx11",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            SYMBOL,
+            [grid_x, 4, 1],
+            [128, 1, 1],
+            32768,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q_ptr);
+                b.push_ptr(k_ptr);
+                b.push_ptr(v_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_i32(nh);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(bs);
+                b.push_f32(sc);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// gfx11 (RDNA3) GQA-fused FA2 prefill for fwht3 K (research opt-in).
+    ///
+    /// Same contract as [`Self::attention_q8_0_fa2_gqa_gfx11`] except K is
+    /// read as fwht3 records (`k_bytes_per_head = 100`, `k_bytes_per_pos =
+    /// 400`, head offset `kv_h * 100` — the
+    /// `kv_cache_write_asym_k_fwht3*`/`attention_flash_fwht3_tile_batched`
+    /// contract) and V stays Q8_0. The kernel rotates this WG's Q rows
+    /// in place (signed FWHT-256) before the shared body, so `q` MUST be a
+    /// single-use prefill buffer: this launcher fails closed under replay
+    /// recording or graph capture (rotation is not idempotent), and the
+    /// dispatch ingress additionally gates tree-verify off. `signs1`/`signs2`
+    /// are the 256-element FWHT sign tables (same tensors the fwht3 K-write
+    /// used). Production ingress is the opt-in branch in the
+    /// `AttnFlashAsym3FwhtBatchedMasked` dispatch arm; call this directly
+    /// only from the throwaway oracle/bench harness.
+    /// `max_ctx_len` is max(positions)+1; the kernel never reads it
+    /// (causal bounds come from `positions[]`); it exists only for profile
+    /// byte attribution, mirroring the incumbent.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_q8_0_fa2_gqa_fwht3k_gfx11(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        signs1: &GpuTensor,
+        signs2: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !matches!(
+            self.arch.as_str(),
+            "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"
+        ) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_fwht3k_gfx11 requires a gfx11 arch, got {}",
+                    self.arch
+                ),
+            ));
+        }
+        if self.replay.is_recording() || self.graphs.capture_mode {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "attention_q8_0_fa2_gqa_fwht3k_gfx11 is eager-only: the in-place Q \
+                 rotation is not replay-idempotent",
+            ));
+        }
+        if n_heads != 24 || n_kv_heads != 4 || head_dim != 256 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_fwht3k_gfx11 requires H24/KV4/D256, got \
+                     H{n_heads}/KV{n_kv_heads}/D{head_dim}"
+                ),
+            ));
+        }
+        if batch_size == 0 || batch_size > 512 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_fwht3k_gfx11 requires 1 <= batch <= 512, got {batch_size}"
+                ),
+            ));
+        }
+        if max_ctx_len == 0 || max_ctx_len > 32768 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_fwht3k_gfx11 requires 1 <= max_ctx_len <= 32768, got {max_ctx_len}"
+                ),
+            ));
+        }
+        let need_qo = batch_size * n_heads * head_dim;
+        if q.numel() < need_qo || out.numel() < need_qo || positions.numel() < batch_size {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_fwht3k_gfx11 capacity mismatch: \
+                     q={} out={} positions={} (need qo>={need_qo}, pos>={batch_size})",
+                    q.numel(),
+                    out.numel(),
+                    positions.numel()
+                ),
+            ));
+        }
+        if signs1.numel() < 256 || signs2.numel() < 256 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_fwht3k_gfx11 requires 256-element sign tables, got \
+                     {} and {}",
+                    signs1.numel(),
+                    signs2.numel()
+                ),
+            ));
+        }
+        const SYMBOL: &str = "attention_q8_0_fa2_gqa_fwht3k_gfx11";
+        // KT32 pinned (see the Q8 launcher): KT64 path removed.
+        if !self.functions.contains_key(SYMBOL) {
+            let src = format!(
+                "#define HIPFIRE_FA2_KT 32\n{}",
+                kernels::ATTENTION_Q8_0_FA2_GQA_FWHT3K_GFX11_SRC
+            );
+            self.ensure_kernel(SYMBOL, &src, SYMBOL)?;
+        }
+        let grid_x = batch_size.div_ceil(8) as u32;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut q_ptr = q.buf.as_ptr();
+        let mut k_ptr = k_cache.buf.as_ptr();
+        let mut v_ptr = v_cache.buf.as_ptr();
+        let mut out_ptr = out.buf.as_ptr();
+        let mut pos_ptr = positions.buf.as_ptr();
+        let mut s1_ptr = signs1.buf.as_ptr();
+        let mut s2_ptr = signs2.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut bs = batch_size as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q_ptr as *mut _ as *mut c_void,
+            &mut k_ptr as *mut _ as *mut c_void,
+            &mut v_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
+            &mut s1_ptr as *mut _ as *mut c_void,
+            &mut s2_ptr as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        // Profile bytes: same analytical upper bound as the Q8 FA2 launcher
+        // (f32 Q + K/V re-read over the causal prefix + f32 out); timing
+        // itself remains exact HIP-event timing.
+        let bytes = crate::profile::attention_q8_0_flash_prefill_bytes(
+            batch_size, n_heads, n_kv_heads, head_dim, max_ctx_len,
+        );
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "attention",
+            "attention_q8_0_fa2_gqa_fwht3k_gfx11",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            SYMBOL,
+            [grid_x, 4, 1],
+            [128, 1, 1],
+            32768,
             &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
