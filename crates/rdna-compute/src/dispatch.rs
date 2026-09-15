@@ -1350,6 +1350,8 @@ impl Gpu {
                 fp8_x_source_ptr: std::ptr::null_mut(),
                 q8_1_mmq_x_scratch: None,
                 q8_1_mmq_x_scratch_bytes: 0,
+                int4_mmq_x_scratch: None,
+                int4_mmq_x_scratch_bytes: 0,
                 mq4v2_fp8_x_scratch: None,
                 mq4v2_fp8_x_scratch_bytes: 0,
                 mq4v2_fp8_half_sums_scratch: None,
@@ -2822,6 +2824,35 @@ impl Gpu {
         let capture_mode = self.graphs.capture_mode;
         let force_blob = self.flags.force_blob_path;
         self.scratch.ensure_q8_1_mmq_x128(
+            &self.hip,
+            &mut self.compiler,
+            &mut self.modules,
+            &mut self.functions,
+            self.active_stream.as_ref(),
+            &mut self.graphs.capture_blobs,
+            capture_mode,
+            force_blob,
+            &mut self.replay,
+            self.device_id,
+            x,
+            batch_size,
+            k,
+        )
+    }
+
+    /// Ensure prefill activations are quantized to int4 (`block_i4_128`) for
+    /// the iu4-direct MMQ consumer (`HIPFIRE_GFX11_MQ4V2_IU4` path).
+    /// See `scratch.rs::ensure_int4_mmq_x`.
+    pub fn ensure_int4_mmq_x(
+        &mut self,
+        x: &GpuTensor,
+        batch_size: usize,
+        k: usize,
+    ) -> HipResult<*mut c_void> {
+        // bind_thread: skip — delegated to scratch.rs
+        let capture_mode = self.graphs.capture_mode;
+        let force_blob = self.flags.force_blob_path;
+        self.scratch.ensure_int4_mmq_x(
             &self.hip,
             &mut self.compiler,
             &mut self.modules,

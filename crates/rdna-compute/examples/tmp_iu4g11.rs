@@ -16,6 +16,7 @@ const IU4_MOD: &str = "mmq_iu4_exp";
 const IU4_FULL_SET: &str = "gemm_mq4g256v2_residual_mmq_iu4_full_set";
 const IU4_FULL_SET_OCC3: &str = "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3";
 const IU4_BASE: &str = "gemm_mq4g256v2_residual_mmq_iu4";
+const IU4_QUANT: &str = "quantize_int4_mmq_ds128";
 const SHARED_IU4: u32 = (128 * 18 + 128 * 44) * 4;
 
 const GROUP: usize = 256;
@@ -308,6 +309,70 @@ fn run_parity_arm(
     ok
 }
 
+/// Bit-oracle for the GPU int4 pre-pass: CPU-pack X with `pack_int4_x`,
+/// run `quantize_int4_mmq_ds128` on-device, and require byte-identical
+/// output (72 B per block: d, s, qs).
+fn run_quant_oracle_arm(gpu: &mut Gpu, n: usize, k: usize) -> bool {
+    assert_eq!(k % 128, 0);
+    let x: Vec<f32> = (0..n * k)
+        .map(|i| {
+            let col = i / k;
+            if col == n - 1 {
+                0.0
+            } else {
+                let scale = 1.0 + (col % 7) as f32 * 0.5;
+                (prng(i, 0x51A7_0E00) * 2.0 - 1.0) * scale
+            }
+        })
+        .collect();
+    let px = pack_int4_x(&x, n, k);
+    let d_x = gpu.upload_f32(&x, &[n * k]).expect("upload x");
+    let nb = k / 128;
+    // F32 tensor (not raw): download_f32 sizes by numel, so allocate
+    // nb*n*72/4 f32 words covering the same bytes.
+    let d_y = gpu
+        .upload_f32(&vec![0.0f32; nb * n * 72 / 4], &[nb * n * 72 / 4])
+        .expect("alloc y");
+    gpu.ensure_kernel_public(IU4_MOD, IU4_SRC, IU4_QUANT)
+        .expect("JIT quant");
+    let mut b = KernargBlob::new();
+    b.push_ptr(d_x.buf.as_ptr() as *const _);
+    b.push_ptr(d_y.buf.as_ptr() as *const _);
+    b.push_i32(k as i32);
+    b.push_i32(n as i32);
+    let mut blob = b.into_vec();
+    let grid = [((k + 1023) / 1024) as u32, n as u32, 1];
+    gpu.launch_kernel_blob(IU4_QUANT, grid, [256, 1, 1], 0, &mut blob)
+        .expect("launch quant");
+    gpu.hip.device_synchronize().expect("sync");
+    let got_f32 = gpu.download_f32(&d_y).expect("download");
+    let got: &[u8] = unsafe {
+        std::slice::from_raw_parts(
+            got_f32.as_ptr() as *const u8,
+            got_f32.len() * std::mem::size_of::<f32>(),
+        )
+    };
+    let mut mism = 0usize;
+    let mut first = None;
+    for (i, (a, b)) in got.iter().zip(px.bytes.iter()).enumerate() {
+        if a != b {
+            if first.is_none() {
+                first = Some((i, *a, *b));
+            }
+            mism += 1;
+        }
+    }
+    let ok = mism == 0 && got.len() == px.bytes.len();
+    eprintln!(
+        "  [quant-oracle N={n} K={k}] bytes={} mism={mism} first={first:?} [{}]",
+        got.len(),
+        if ok { "PASS" } else { "FAIL" }
+    );
+    let _ = gpu.free_tensor(d_x);
+    let _ = gpu.free_tensor(d_y);
+    ok
+}
+
 fn bench_kernel(
     gpu: &mut Gpu,
     label: &str,
@@ -384,6 +449,27 @@ fn main() {
             return;
         }
     };
+    let do_quant = args.iter().any(|a| a == "quant-oracle");
+    if do_quant {
+        if gpu.arch != "gfx1100" && gpu.arch != "gfx1151" {
+            eprintln!("SKIP: arch {} is not gfx1100/gfx1151", gpu.arch);
+            return;
+        }
+        eprintln!("iu4 pre-pass quant-oracle on {}", gpu.arch);
+        let mut all_ok = true;
+        for &(n, k) in &[(128usize, 512usize), (100, 512), (256, 1024), (512, 5120)] {
+            if !run_quant_oracle_arm(&mut gpu, n, k) {
+                all_ok = false;
+            }
+        }
+        if all_ok {
+            eprintln!("PASS: quant-oracle bit-exact on all arms");
+        } else {
+            eprintln!("FAIL: quant-oracle mismatch");
+            std::process::exit(1);
+        }
+        return;
+    }
     if gpu.arch != "gfx1100" {
         eprintln!("SKIP: arch {} is not gfx1100", gpu.arch);
         return;
