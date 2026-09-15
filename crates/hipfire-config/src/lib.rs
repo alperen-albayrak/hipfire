@@ -2139,6 +2139,15 @@ pub static FIELDS: &[ConfigField] = &[
         "Enable the gfx11 GQA-fused FA2 prefill attention route (default on gfx1100/gfx1151; set to false or HIPFIRE_GFX11_FA2_PREFILL=0 to opt out)."
     ),
     process_bool_field!(
+        "kernel.gfx11_mq4v2_iu4",
+        "gfx11_mq4v2_iu4",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_GFX11_MQ4V2_IU4",
+        "Enable the gfx11 iu4-direct MMQ prefill route (opt-in on gfx1100/gfx1151; set to true or HIPFIRE_GFX11_MQ4V2_IU4=1 to opt in)."
+    ),
+    process_bool_field!(
         "kernel.dot2_gemv",
         "dot2_gemv",
         Kernel,

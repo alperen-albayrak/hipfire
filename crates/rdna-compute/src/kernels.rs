@@ -3332,6 +3332,12 @@ pub const GEMM_HFQ4G256_RESIDUAL_MMQ_SRC: &str =
 // unchanged; metadata loads select the dual fp16 header per 128-weight half.
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq.hip");
+// MQ4V2 (qt44) iu4-direct MMQ sister (W4A4 prefill): weight nibbles feed
+// wmma_i32_16x16x16_iu4 directly, activations are int4 via the
+// quantize_int4_mmq_ds128 prelude in the same file. Opt-in through
+// HIPFIRE_GFX11_MQ4V2_IU4 on gfx1100/gfx1151.
+pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx11.hip");
 // gfx12 (RDNA4) i8-WMMA MMQ port (single-wave 16-row tile, [32,1,1], LDS 0).
 // RDNA3's #if guard excludes gfx12, so RDNA4 needs this separate source.
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX12_SRC: &str =

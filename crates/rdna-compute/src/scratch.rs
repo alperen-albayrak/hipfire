@@ -66,6 +66,12 @@ pub struct ScratchState {
     pub fp8_x_source_ptr: *mut c_void,
     pub q8_1_mmq_x_scratch: Option<DeviceBuffer>,
     pub q8_1_mmq_x_scratch_bytes: usize,
+    /// Dedicated iu4-direct MMQ pre-pass X buffer (`block_i4_128`, 72 B per
+    /// [K/128 block, batch]). Not shared with `q8_1_mmq_x_scratch` (144 B
+    /// blocks): the iu4 consumer reads nibble headers the Q8_1 prelude
+    /// never writes, so aliasing would corrupt both routes.
+    pub int4_mmq_x_scratch: Option<DeviceBuffer>,
+    pub int4_mmq_x_scratch_bytes: usize,
     /// Dedicated MQ4v2 FP8 pre-pass X buffer (E4M3 bytes, [N,K]). Not shared
     /// with `fp8_x_scratch` and never pointer-cached — always overwritten.
     pub mq4v2_fp8_x_scratch: Option<DeviceBuffer>,
@@ -1192,6 +1198,100 @@ impl ScratchState {
         }
 
         Ok(self.q8_1_mmq_x_scratch.as_ref().unwrap().as_ptr())
+    }
+
+    /// Ensure prefill activations are quantized to int4 (`block_i4_128`, 72 B
+    /// per [K/128 block, batch]: f32 d, i32 s, 64 B nibbles) for the
+    /// iu4-direct MMQ consumer (`gemm_mq4g256v2_mmq_prequant_iu4`), gated by
+    /// `HIPFIRE_GFX11_MQ4V2_IU4`. Same [K/128, batch] order and always-launch
+    /// lifetime contract as [`Self::ensure_q8_1_mmq_x128`], but a dedicated
+    /// `int4_mmq_x_scratch` buffer — the layouts differ (72 B vs 144 B) and
+    /// the iu4 consumer reads nibble headers the Q8_1 prelude never writes.
+    pub fn ensure_int4_mmq_x(
+        &mut self,
+        hip: &HipRuntime,
+        compiler: &mut crate::compiler::KernelCompiler,
+        modules: &mut HashMap<String, Module>,
+        functions: &mut HashMap<String, Function>,
+        stream: Option<&Stream>,
+        capture_blobs: &mut Vec<Vec<u8>>,
+        capture_mode: bool,
+        force_blob_path: bool,
+        replay: &mut crate::replay::ReplayController,
+        device_id: i32,
+        x: &GpuTensor,
+        batch_size: usize,
+        k: usize,
+    ) -> HipResult<*mut c_void> {
+        crate::graph::bind_thread(hip, device_id)?;
+        compile_and_load_kernel(
+            compiler,
+            hip,
+            modules,
+            functions,
+            "gemm_mq4g256v2_residual_mmq_iu4",
+            kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_SRC,
+            "quantize_int4_mmq_ds128",
+        )?;
+
+        let blocks_k = (k + 127) / 128;
+        let block_i4_128_bytes = 72usize;
+        let needed = blocks_k * batch_size * block_i4_128_bytes;
+        grow_scratch_buffer(
+            hip,
+            &mut self.int4_mmq_x_scratch,
+            &mut self.int4_mmq_x_scratch_bytes,
+            needed,
+        )?;
+
+        let src_ptr = x.buf.as_ptr();
+        let must_convert = true;
+        if must_convert {
+            let out_ptr = self.int4_mmq_x_scratch.as_ref().unwrap().as_ptr();
+            let mut xp = src_ptr;
+            let mut yp = out_ptr;
+            let mut k_val = k as i32;
+            let mut n_val = batch_size as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &mut xp as *mut _ as *mut c_void,
+                &mut yp as *mut _ as *mut c_void,
+                &mut k_val as *mut _ as *mut c_void,
+                &mut n_val as *mut _ as *mut c_void,
+            ];
+            let grid_x = ((k + 1023) / 1024) as u32;
+            let grid_y = batch_size as u32;
+            let bytes = batch_size * k * 4 + blocks_k * batch_size * block_i4_128_bytes;
+            let timer =
+                crate::profile::begin_timer(hip, "quantize", "quantize_int4_mmq_ds128", bytes);
+            launch_maybe_blob(
+                hip,
+                Some(&*compiler),
+                functions,
+                stream,
+                capture_blobs,
+                capture_mode,
+                force_blob_path,
+                Some(replay),
+                "quantize_int4_mmq_ds128",
+                [grid_x, grid_y, 1],
+                [256, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = KernargBlob::new();
+                    b.push_ptr(src_ptr);
+                    b.push_ptr(out_ptr);
+                    b.push_i32(k_val);
+                    b.push_i32(n_val);
+                    b
+                },
+            )?;
+            if let Some(t) = timer {
+                t.finish(hip);
+            }
+        }
+
+        Ok(self.int4_mmq_x_scratch.as_ref().unwrap().as_ptr())
     }
 
     /// Invalidate the FP16/FP8 activation scratch caches. Must be called

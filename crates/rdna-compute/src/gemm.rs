@@ -18483,6 +18483,129 @@ impl Gpu {
         self.gemm_mq4g256v2_mmq_prequant(a_raw, x_q8_ptr, y, m, k, batch_size, true)
     }
 
+    /// iu4-direct MMQ consumer for the MQ4V2 family (W4A4 prefill): reads the
+    /// int4 `block_i4_128` prelude from `ensure_int4_mmq_x`, feeds weight
+    /// nibbles straight to `wmma_i32_16x16x16_iu4` (halved A-side LDS).
+    /// Opt-in via `HIPFIRE_GFX11_MQ4V2_IU4` on gfx1100/gfx1151; same grid,
+    /// block, and full/add/base symbol structure as
+    /// `gemm_mq4g256v2_mmq_prequant`. Full tiles use the `_occ3` entries
+    /// (`__launch_bounds__(256,3)`; measured not-slower than occ2 on XTX),
+    /// the M/N tail uses the base entry.
+    fn gemm_mq4g256v2_mmq_prequant_iu4(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_i4_ptr: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        add: bool,
+    ) -> HipResult<()> {
+        if !matches!(self.arch.as_str(), "gfx1100" | "gfx1151") {
+            return Err(hip_bridge::HipError::new(
+                1,
+                &format!(
+                    "MQ4V2 iu4 MMQ requires exact gfx1100/gfx1151 (arch={} m={m} k={k} n={batch_size})",
+                    self.arch
+                ),
+            ));
+        }
+        if k % 256 != 0 {
+            return Err(hip_bridge::HipError::new(
+                1,
+                &format!("MQ4V2 iu4 MMQ requires K divisible by 256 (m={m} k={k} n={batch_size})"),
+            ));
+        }
+        self.bind_thread()?;
+        let full = m % 128 == 0 && batch_size % 128 == 0;
+        let kernel_name = match (full, add) {
+            (true, true) => "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3",
+            (true, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3",
+            (false, _) => "gemm_mq4g256v2_residual_mmq_iu4",
+        };
+        const MODULE: &str = "gemm_mq4g256v2_residual_mmq_iu4";
+        self.ensure_kernel(
+            MODULE,
+            kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_SRC,
+            kernel_name,
+        )?;
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut xq_ptr = x_i4_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut add_val = i32::from(add);
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut xq_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut add_val as *mut _ as *mut c_void,
+        ];
+        const MMQ_X: usize = 128;
+        const MMQ_Y: usize = 128;
+        // Y tile: per-128-K block per column 64 B nibbles + (f32 d, i32 s)
+        // header = 72 B = 18 ints. X tile: 32 nibble words + 8 half2 header
+        // slots + 4 pad = 44 ints. LDS = (128*18 + 128*44)*4 = 31744 B.
+        const MMQ_TILE_Y_K: usize = 18;
+        const MMQ_TILE_X_K: usize = 44;
+        let row_tiles = m.div_ceil(MMQ_Y);
+        let batch_tiles = batch_size.div_ceil(MMQ_X);
+        let shared_mem =
+            ((MMQ_X * MMQ_TILE_Y_K + MMQ_Y * MMQ_TILE_X_K) * std::mem::size_of::<i32>()) as u32;
+        let bytes = m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES + batch_size * m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
+        let result = self.launch_maybe_blob(
+            kernel_name,
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 8, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(xq_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b.push_i32(add_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    pub fn gemm_mq4g256v2_mmq_set_prequant_iu4(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_i4_ptr: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.gemm_mq4g256v2_mmq_prequant_iu4(a_raw, x_i4_ptr, y, m, k, batch_size, false)
+    }
+
+    pub fn gemm_mq4g256v2_mmq_add_prequant_iu4(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_i4_ptr: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.gemm_mq4g256v2_mmq_prequant_iu4(a_raw, x_i4_ptr, y, m, k, batch_size, true)
+    }
+
     /// WMMA-accelerated batched HFQ4-G256 GEMM with residual add.
     /// gfx1100+ only. 16×16 output tiles via wave32 WMMA.
     /// Converts X to FP16, then uses __builtin_amdgcn_wmma_f32_16x16x16_f16_w32.
@@ -27777,6 +27900,37 @@ impl Gpu {
         }
         self.gemm_mq4g256v2_mmq_set_prequant(a, xq, y, m, k, batch_size)
     }
+    /// iu4-direct sister of `gemm_mq4g256v2_small_tail_set`: same zeroed-Y
+    /// SET wrapper over the MW4 f16 tail kernel, falling back to the iu4
+    /// consumer (`xq` is the int4 prelude here, not Q8_1).
+    fn gemm_mq4g256v2_small_tail_set_iu4(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        xq: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        if m == 0 || batch_size == 0 {
+            return Ok(());
+        }
+        match self.active_stream.as_ref() {
+            Some(stream) => self
+                .hip
+                .memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
+            None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
+        }
+        if self
+            .gemm_mqv2_residual_wmma_gfx11_mw_lds(4, 4, a, x, y, m, k, batch_size)
+            .is_ok()
+        {
+            return Ok(());
+        }
+        self.gemm_mq4g256v2_mmq_set_prequant_iu4(a, xq, y, m, k, batch_size)
+    }
+
     /// MQ4 v2 (qt 44) — gfx11 (RDNA3/3.5) qkvza WMMA.
     /// Sister of `gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2` but with gfx11
     /// WMMA contracts (half16, w32, interleaved C). Distinct source/symbol/module
@@ -27810,6 +27964,28 @@ impl Gpu {
             && batch_size >= 128
             && batch_size % 128 == 0
         {
+            // iu4-direct MMQ (W4A4 prefill) opt-in: same batch predicate as
+            // the Q8_1 MMQ route below; flag off leaves every byte unchanged.
+            if self.flags.gfx11_mmq_iu4_enabled() {
+                let xq = self.ensure_int4_mmq_x(x, batch_size, k)?;
+                self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_qkv, xq, y_qkv, qkv_m, k, batch_size)?;
+                self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_z, xq, y_z, z_m, k, batch_size)?;
+                if beta_m < 128 {
+                    self.gemm_mq4g256v2_small_tail_set_iu4(
+                        a_beta, x, xq, y_beta, beta_m, k, batch_size,
+                    )?;
+                } else {
+                    self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_beta, xq, y_beta, beta_m, k, batch_size)?;
+                }
+                if alpha_m < 128 {
+                    self.gemm_mq4g256v2_small_tail_set_iu4(
+                        a_alpha, x, xq, y_alpha, alpha_m, k, batch_size,
+                    )?;
+                } else {
+                    self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_alpha, xq, y_alpha, alpha_m, k, batch_size)?;
+                }
+                return Ok(());
+            }
             let xq = self.ensure_q8_1_mmq_x_v2(x, batch_size, k)?;
             self.gemm_mq4g256v2_mmq_set_prequant(a_qkv, xq, y_qkv, qkv_m, k, batch_size)?;
             self.gemm_mq4g256v2_mmq_set_prequant(a_z, xq, y_z, z_m, k, batch_size)?;
@@ -28329,6 +28505,14 @@ impl Gpu {
             && batch_size >= 128
             && batch_size % 128 == 0
         {
+            // iu4-direct MMQ (W4A4 prefill) opt-in; flag off is unchanged.
+            if self.flags.gfx11_mmq_iu4_enabled() {
+                let xq = self.ensure_int4_mmq_x(x, batch_size, k)?;
+                self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_q, xq, y_q, q_m, k, batch_size)?;
+                self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_k, xq, y_k, k_m, k, batch_size)?;
+                self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_v, xq, y_v, v_m, k, batch_size)?;
+                return Ok(());
+            }
             let xq = self.ensure_q8_1_mmq_x_v2(x, batch_size, k)?;
             self.gemm_mq4g256v2_mmq_set_prequant(a_q, xq, y_q, q_m, k, batch_size)?;
             self.gemm_mq4g256v2_mmq_set_prequant(a_k, xq, y_k, k_m, k, batch_size)?;
@@ -29159,6 +29343,13 @@ impl Gpu {
             && batch_size >= 128
             && batch_size % 128 == 0
         {
+            // iu4-direct MMQ (W4A4 prefill) opt-in; flag off is unchanged.
+            if self.flags.gfx11_mmq_iu4_enabled() {
+                let xq = self.ensure_int4_mmq_x(x, batch_size, k)?;
+                self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_gate, xq, y_gate, gate_m, k, batch_size)?;
+                self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_up, xq, y_up, up_m, k, batch_size)?;
+                return Ok(());
+            }
             let xq = self.ensure_q8_1_mmq_x_v2(x, batch_size, k)?;
             self.gemm_mq4g256v2_mmq_set_prequant(a_gate, xq, y_gate, gate_m, k, batch_size)?;
             self.gemm_mq4g256v2_mmq_set_prequant(a_up, xq, y_up, up_m, k, batch_size)?;
@@ -29889,6 +30080,12 @@ impl Gpu {
             && batch_size >= 128
             && batch_size % 128 == 0
         {
+            // iu4-direct MMQ (W4A4 prefill) opt-in; flag off is unchanged.
+            if self.flags.gfx11_mmq_iu4_enabled() {
+                let xq = self.ensure_int4_mmq_x(x, batch_size, k)?;
+                self.gemm_mq4g256v2_mmq_add_prequant_iu4(a_raw, xq, y, m, k, batch_size)?;
+                return Ok(());
+            }
             let xq = self.ensure_q8_1_mmq_x_v2(x, batch_size, k)?;
             self.gemm_mq4g256v2_mmq_add_prequant(a_raw, xq, y, m, k, batch_size)?;
             return Ok(());
