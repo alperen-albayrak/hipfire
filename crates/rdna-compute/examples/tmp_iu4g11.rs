@@ -137,6 +137,11 @@ struct PackedX {
 
 /// W4A4 recipe: per-128 amax, 8-candidate MSE-clip grid
 /// d_j = (amax/7)*0.5*(1+j/7), strict-< argmin; zero group -> d=1, q=0.
+/// Lane-mirrored f32 match of `quantize_int4_mmq_ds128` (f32 grid with
+/// explicit single-rounding FMA): wave32 lane l owns group elements
+/// 4l..4l+3, per-lane f32 partial MSE, snapshot butterfly (offsets
+/// 16..1), per-lane strict-< argmin, d from lane 0. Bit-exactness needs
+/// the same op order AND single-rounding FMA on both sides (`mul_add`).
 fn pack_int4_x(x: &[f32], n: usize, k: usize) -> PackedX {
     assert_eq!(x.len(), n * k);
     assert_eq!(k % 128, 0);
@@ -154,32 +159,49 @@ fn pack_int4_x(x: &[f32], n: usize, k: usize) -> PackedX {
             let (db, ssum) = if amax == 0.0 {
                 (1.0f32, 0i32)
             } else {
-                let mut best_mse = f64::INFINITY;
-                let mut best_d = 1.0f32;
-                let mut best_q = [0i8; 128];
+                // Per-lane quantized picks (lane l owns elements 4l..4l+3).
+                let mut lane_d = [1.0f32; 32];
+                let mut lane_q = [[0i8; 4]; 32];
+                let mut best = [f32::INFINITY; 32];
                 for j in 0..8 {
                     let dj = (amax / 7.0) * 0.5 * (1.0 + j as f32 / 7.0);
-                    let mut mse = 0.0f64;
-                    let mut qq = [0i8; 128];
-                    for i in 0..128 {
-                        let v = x[col * k + b * 128 + i];
-                        let qi = (v / dj).round().clamp(-8.0, 7.0) as i8;
-                        qq[i] = qi;
-                        let e = v as f64 - (qi as f64 * dj as f64);
-                        mse += e * e;
+                    let mut part = [0.0f32; 32];
+                    let mut qq = [[0i8; 4]; 32];
+                    for l in 0..32 {
+                        let mut m = 0.0f32;
+                        for e in 0..4 {
+                            let v = x[col * k + b * 128 + l * 4 + e];
+                            let qf = (v / dj).round_ties_even().clamp(-8.0, 7.0);
+                            let qi = qf as i8;
+                            qq[l][e] = qi;
+                            let err = (-qf).mul_add(dj, v);
+                            m = err.mul_add(err, m);
+                        }
+                        part[l] = m;
                     }
-                    if mse < best_mse {
-                        best_mse = mse;
-                        best_d = dj;
-                        best_q = qq;
+                    // Snapshot butterfly: each lane reads pre-update values.
+                    for &off in &[16, 8, 4, 2, 1] {
+                        let prev = part;
+                        for l in 0..32 {
+                            part[l] = prev[l] + prev[l ^ off];
+                        }
+                    }
+                    for l in 0..32 {
+                        if part[l] < best[l] {
+                            best[l] = part[l];
+                            lane_d[l] = dj;
+                            lane_q[l] = qq[l];
+                        }
                     }
                 }
                 let mut ss = 0i32;
-                for i in 0..128 {
-                    q[col * k + b * 128 + i] = best_q[i];
-                    ss += best_q[i] as i32;
+                for l in 0..32 {
+                    for e in 0..4 {
+                        q[col * k + b * 128 + l * 4 + e] = lane_q[l][e];
+                        ss += lane_q[l][e] as i32;
+                    }
                 }
-                (best_d, ss)
+                (lane_d[0], ss)
             };
             if amax == 0.0 {
                 for i in 0..128 {

@@ -63,13 +63,14 @@ static_assert(sizeof(block_i4_128) == 72, "bad block size");
 // contract as quantize_q8_1_mmq_ds4_x128 (block (256,1,1), each thread 4
 // floats, grid [(K+1023)/1024, N]), but emits block_i4_128 (72 B: f32 d,
 // i32 s, 64 B nibbles) with the W4A4 recipe — per-128 amax, 8-candidate
-// MSE-clip grid d_j=(amax/7)*0.5*(1+j/7), roundf, clamp[-8,7], strict-<
+// MSE-clip grid d_j=(amax/7)*0.5*(1+j/7), rintf, clamp[-8,7], strict-<
 // argmin; zero group -> d=1, q=0, s=0. One wave32 covers exactly one
 // 128-K group (lane l owns elements 4l..4l+3), so amax/MSE/sum reduce with
 // width-32 shuffles (offsets 16..1), wave64-safe like the Q8_1 preludes.
-// MSE accumulates in f64 to match the CPU-pack oracle bit-exactly; s is an
-// exact integer reduction. Arch-portable (no WMMA): shared by every arch
-// whose launcher admits the iu4 consumer.
+// MSE accumulates in f32 with explicit single-rounding FMA (__fmaf_rn;
+// f64 runs at 1/16 rate on RDNA3) to match the lane-mirrored CPU-pack
+// oracle bit-exactly; s is an exact integer reduction. Arch-portable
+// (no WMMA): shared by every arch whose launcher admits the iu4 consumer.
 extern "C" __global__ void quantize_int4_mmq_ds128(
     const float* __restrict__ X,
     block_i4_128* __restrict__ Y,
@@ -94,16 +95,16 @@ extern "C" __global__ void quantize_int4_mmq_ds128(
 
     float best_d = 1.0f;
     if (amax != 0.0f) {
-        double best_mse = 1.0e300;
+        float best_mse = 1.0e30f;
         for (int j = 0; j < 8; ++j) {
             const float dj = (amax / 7.0f) * 0.5f * (1.0f + (float)j / 7.0f);
-            double mse = 0.0;
+            float mse = 0.0f;
             #pragma unroll
             for (int e = 0; e < 4; ++e) {
-                float q = roundf(xv[e] / dj);
+                float q = rintf(xv[e] / dj);
                 q = fminf(fmaxf(q, -8.0f), 7.0f);
-                const double err = (double)xv[e] - (double)q * (double)dj;
-                mse += err * err;
+                const float err = __fmaf_rn(-q, dj, xv[e]);
+                mse = __fmaf_rn(err, err, mse);
             }
             for (int offset = 16; offset > 0; offset >>= 1) {
                 mse += __shfl_xor(mse, offset, 32);
@@ -118,7 +119,7 @@ extern "C" __global__ void quantize_int4_mmq_ds128(
     int q4[4];
     #pragma unroll
     for (int e = 0; e < 4; ++e) {
-        float q = (amax == 0.0f) ? 0.0f : roundf(xv[e] / best_d);
+        float q = (amax == 0.0f) ? 0.0f : rintf(xv[e] / best_d);
         q = fminf(fmaxf(q, -8.0f), 7.0f);
         q4[e] = (int)q;
     }

@@ -18504,13 +18504,16 @@ impl Gpu {
         if !matches!(self.arch.as_str(), "gfx1100" | "gfx1151") {
             return Err(hip_bridge::HipError::new(
                 1,
-                "MQ4V2 iu4 MMQ requires exact gfx1100/gfx1151",
+                &format!(
+                    "MQ4V2 iu4 MMQ requires exact gfx1100/gfx1151 (arch={} m={m} k={k} n={batch_size})",
+                    self.arch
+                ),
             ));
         }
         if k % 256 != 0 {
             return Err(hip_bridge::HipError::new(
                 1,
-                "MQ4V2 iu4 MMQ requires K divisible by 256",
+                &format!("MQ4V2 iu4 MMQ requires K divisible by 256 (m={m} k={k} n={batch_size})"),
             ));
         }
         self.bind_thread()?;
