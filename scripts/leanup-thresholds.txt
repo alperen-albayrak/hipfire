@@ -38,7 +38,14 @@ required_features_daemon    == 0
 # model still serving; the guard refuses it before any teardown or allocation.
 # The load arm was sitting exactly at the old ceiling, so no correctness fix
 # there fits under it. Paid down when the arm's branch duplication is factored.
-daemon_lines                <= 4863
+# RATCHET-RAISE 4863 -> 4873: traded 10 lines of daemon main.rs for multi-turn
+# VL framing. The VL dispatch arm handed `generate_vl` only the flat `prompt`
+# string, so any request carrying an image was framed as a single turn and the
+# rest of the conversation -- system prompt included -- was silently dropped.
+# Forwarding `messages` plus the image's turn index is the whole fix; the
+# framing itself lives in hipfire-generate. Paid down when the VL arm's
+# reset/dispatch duplication is factored out of the dispatch loop.
+daemon_lines                <= 4873
 
 # Examples compile on every `cargo build --all-targets`. Archived research
 # probes are gated behind `--features lab`; this is the count still ungated.

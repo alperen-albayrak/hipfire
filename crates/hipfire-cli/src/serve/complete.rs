@@ -1550,6 +1550,10 @@ pub(crate) struct RequestContract {
     pub conversation_messages: serde_json::Value,
     pub tool_choice_policy: ToolChoicePolicy,
     pub forwarded_tools: Option<serde_json::Value>,
+    /// Index into `messages` of the turn that carried the request's image, if
+    /// any. Forwarded so VL framing can splice the visual run into the right
+    /// turn instead of assuming the image belongs to the last user turn.
+    pub image_message_index: Option<usize>,
 }
 
 /// Architectures that surface reasoning content in multi-turn message history
@@ -1594,13 +1598,72 @@ pub(crate) fn project_request_contract(
     let conversation_messages = messages.clone();
     let (tool_choice_policy, forwarded_tools) =
         project_tool_choice(body.get("tool_choice"), body.get("tools"), &mut messages)?;
+    let image_message_index = image_message_index(body.get("messages"), &messages);
     Ok(RequestContract {
         max_tokens,
         messages,
         conversation_messages,
         tool_choice_policy,
         forwarded_tools,
+        image_message_index,
     })
+}
+
+/// Index, within the message list that crosses the wire, of the turn carrying
+/// the request's image.
+///
+/// The daemon cannot work this out for itself: [`normalize_openai_messages`]
+/// flattens `messages[].content` to text, erasing the `image_url` part. Absent
+/// this, VL framing can only assume the image belongs to the last user turn.
+///
+/// `normalized` is the FINAL list, after default-system and tool-choice
+/// projection. Each of those inserts at most one system turn and always at
+/// index 0, so the length difference is exactly how far every surviving turn
+/// shifted.
+pub(crate) fn image_message_index(
+    original: Option<&serde_json::Value>,
+    normalized: &serde_json::Value,
+) -> Option<usize> {
+    let original = original.and_then(serde_json::Value::as_array)?;
+    let mut kept = 0usize;
+    let mut found: Option<usize> = None;
+    for message in original {
+        // Mirrors `normalize_openai_messages`'s role filter -- the only thing
+        // there that drops a message.
+        let survives = matches!(
+            message.get("role").and_then(serde_json::Value::as_str),
+            Some(
+                "developer"
+                    | "toolResult"
+                    | "tool_result"
+                    | "system"
+                    | "user"
+                    | "assistant"
+                    | "tool"
+            )
+        );
+        if !survives {
+            continue;
+        }
+        if found.is_none()
+            && message
+                .get("content")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|parts| {
+                    parts.iter().any(|part| {
+                        part.get("type").and_then(serde_json::Value::as_str) == Some("image_url")
+                    })
+                })
+        {
+            found = Some(kept);
+        }
+        kept += 1;
+    }
+    let found = found?;
+    let shift = normalized
+        .as_array()
+        .map_or(0, |list| list.len().saturating_sub(kept));
+    Some(found + shift)
 }
 
 /// One correlated generation attempt under the shared serve runtime lock.
@@ -1700,6 +1763,11 @@ pub(crate) fn complete_request_attempt(
         });
         if let Some(image) = image_base64 {
             generate["image_base64"] = serde_json::Value::String(image);
+            // Names the turn the image rode in on, so VL framing keeps the rest
+            // of the conversation instead of collapsing to that single turn.
+            if let Some(index) = contract.image_message_index {
+                generate["image_message_index"] = serde_json::Value::from(index);
+            }
         }
         for (key, config_key) in [
             ("temperature", "generation.temperature"),
@@ -3285,6 +3353,70 @@ mod tests {
         });
         let messages = normalize_openai_messages(body.get("messages"), false);
         assert_eq!(last_user_prompt(&messages).as_deref(), Some("onetwo"));
+    }
+
+    #[test]
+    fn image_message_index_tracks_normalization_and_injection() {
+        // Unknown roles are dropped by normalization, and a default system turn
+        // is injected at the front -- the index must name the same turn in the
+        // list that actually crosses the wire.
+        let body = serde_json::json!({
+            "messages": [
+                { "role": "bogus", "content": "dropped" },
+                { "role": "user", "content": "my name is John" },
+                { "role": "assistant", "content": "noted" },
+                { "role": "user", "content": [
+                    { "type": "text", "text": "what is this?" },
+                    { "type": "image_url", "image_url": { "url": "data:image/png;base64,YWJj" } }
+                ] }
+            ]
+        });
+        let mut normalized = normalize_openai_messages(body.get("messages"), false);
+        inject_default_system_message(&mut normalized, Some("be terse"));
+
+        let index = image_message_index(body.get("messages"), &normalized)
+            .expect("image turn should be located");
+        // [system(injected), user, assistant, user+image] -> index 3
+        assert_eq!(index, 3);
+        assert_eq!(
+            normalized[index]["role"].as_str(),
+            Some("user"),
+            "index must name the image's own user turn"
+        );
+        assert_eq!(
+            normalized[index]["content"].as_str(),
+            Some("what is this?"),
+            "image turn keeps its text content after flattening"
+        );
+    }
+
+    #[test]
+    fn image_message_index_is_none_without_an_image() {
+        let body = serde_json::json!({
+            "messages": [{ "role": "user", "content": "text only" }]
+        });
+        let normalized = normalize_openai_messages(body.get("messages"), false);
+        assert!(image_message_index(body.get("messages"), &normalized).is_none());
+    }
+
+    #[test]
+    fn image_message_index_finds_an_earlier_turn() {
+        let body = serde_json::json!({
+            "messages": [
+                { "role": "user", "content": [
+                    { "type": "text", "text": "what colour?" },
+                    { "type": "image_url", "image_url": { "url": "data:image/png;base64,YWJj" } }
+                ] },
+                { "role": "assistant", "content": "red" },
+                { "role": "user", "content": "and what did I ask?" }
+            ]
+        });
+        let normalized = normalize_openai_messages(body.get("messages"), false);
+        assert_eq!(
+            image_message_index(body.get("messages"), &normalized),
+            Some(0),
+            "an image in a non-final turn must not be reported as the last turn"
+        );
     }
 
     #[test]

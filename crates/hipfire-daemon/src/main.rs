@@ -2491,6 +2491,12 @@ fn main() {
                 let system = msg.get("system").and_then(|v| v.as_str());
                 let image = msg.get("image").and_then(|v| v.as_str());
                 let image_base64 = msg.get("image_base64").and_then(|v| v.as_str());
+                // Which turn carried the image: the gateway scans the content
+                // parts, the daemon only ever sees `content` flattened to text.
+                let image_message_index = msg
+                    .get("image_message_index")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize);
 
                 // Structured-tools + structured-messages support (Phase 1 of
                 // Jinja-everywhere migration). When present, both fields are
@@ -3001,6 +3007,10 @@ fn main() {
                         id,
                         prompt,
                         system_prompt: system,
+                        // Prior turns reach VL framing here; without them an
+                        // image request discarded the whole conversation.
+                        messages: messages_history.as_deref(),
+                        image_message_index,
                         image_source: source,
                         temp,
                         top_p,

@@ -272,6 +272,63 @@ impl<'a> ChatFrame<'a> {
         scaffold.append_assistant_prefix(&mut out, self.assistant_prefix);
         out
     }
+
+    /// Build a multi-turn prompt in which ONE turn's body is supplied as
+    /// pre-built tokens instead of text — the multi-turn analogue of
+    /// [`build_with_user_tokens`](ChatFrame::build_with_user_tokens).
+    ///
+    /// `history` is the whole conversation in chronological order. The turn at
+    /// `splice_at` is emitted as a user turn carrying `user_tokens` verbatim
+    /// and its own `&str` content is ignored; every other turn renders
+    /// normally. `splice_at >= history.len()` appends `user_tokens` as a
+    /// trailing user turn, so a caller that cannot locate the turn still
+    /// produces a well-formed prompt.
+    ///
+    /// The VL path needs this. Its image turn carries a
+    /// `<|vision_start|> <|image_pad|>xN <|vision_end|>` run that has no
+    /// textual spelling, so that turn cannot go through `append_user_turn` —
+    /// which is why VL previously framed a single turn and dropped the rest of
+    /// the conversation (see `generate_vl`).
+    ///
+    /// Unlike [`build_multi_turn`](ChatFrame::build_multi_turn), `System` and
+    /// `Tool` turns are rendered rather than rejected: this path is fed whole
+    /// agent conversations, which routinely carry both. A `System` turn is
+    /// emitted in place; `self.system` is emitted first only when `Some`.
+    ///
+    /// In `raw` mode, returns `user_tokens` verbatim, matching
+    /// `build_with_user_tokens`.
+    pub fn build_multi_turn_splicing_user_tokens(
+        &self,
+        history: &[(Role, &str)],
+        splice_at: usize,
+        user_tokens: &[u32],
+    ) -> Vec<u32> {
+        if self.raw {
+            return user_tokens.to_vec();
+        }
+        let scaffold = ChatScaffold::for_tokenizer(self.tokenizer);
+        let mut out: Vec<u32> = Vec::new();
+        if let Some(sys) = self.system {
+            scaffold.append_system(&mut out, sys);
+        }
+        for (index, (role, content)) in history.iter().enumerate() {
+            if index == splice_at {
+                scaffold.append_user_turn_tokens(&mut out, user_tokens);
+                continue;
+            }
+            match role {
+                Role::System => scaffold.append_system(&mut out, content),
+                Role::User => scaffold.append_user_turn(&mut out, content),
+                Role::Assistant => scaffold.append_assistant_turn(&mut out, content),
+                Role::Tool => scaffold.append_tool_turn(&mut out, content),
+            }
+        }
+        if splice_at >= history.len() {
+            scaffold.append_user_turn_tokens(&mut out, user_tokens);
+        }
+        scaffold.append_assistant_prefix(&mut out, self.assistant_prefix);
+        out
+    }
 }
 
 /// Tokens that continue an existing assistant turn into the next user turn.
@@ -2215,6 +2272,114 @@ mod tests {
         let got = frame.build();
         let expected = t.encode("completion text");
         assert_eq!(got, expected, "raw=true should bypass ChatML scaffolding");
+    }
+
+    /// A turn appender: `<|im_start|>role\n BODY <|im_end|>\n`.
+    fn expect_turn(out: &mut Vec<u32>, t: &Tokenizer, role: &str, body: &[u32]) {
+        out.extend_from_slice(&t.encode("<|im_start|>"));
+        out.extend_from_slice(&t.encode(role));
+        out.extend_from_slice(&t.encode("\n"));
+        out.extend_from_slice(body);
+        out.extend_from_slice(&t.encode("<|im_end|>"));
+        out.extend_from_slice(&t.encode("\n"));
+    }
+
+    /// The VL regression: an image turn must not erase the conversation.
+    #[test]
+    fn splicing_builder_keeps_system_and_prior_turns() {
+        let t = make_tokenizer();
+        let history: [(Role, &str); 4] = [
+            (Role::System, "be terse"),
+            (Role::User, "my name is John"),
+            (Role::Assistant, "noted"),
+            (Role::User, "what is my name?"),
+        ];
+        let body = t.encode("VISUAL");
+        let frame = ChatFrame {
+            tokenizer: &t,
+            system: None,
+            user: "",
+            assistant_prefix: AssistantPrefix::Plain,
+            raw: false,
+        };
+        let got = frame.build_multi_turn_splicing_user_tokens(&history, 3, &body);
+
+        let mut expected: Vec<u32> = Vec::new();
+        expect_turn(&mut expected, &t, "system", &t.encode("be terse"));
+        expect_turn(&mut expected, &t, "user", &t.encode("my name is John"));
+        expect_turn(&mut expected, &t, "assistant", &t.encode("noted"));
+        expect_turn(&mut expected, &t, "user", &body);
+        expected.extend_from_slice(&t.encode("<|im_start|>"));
+        expected.extend_from_slice(&t.encode("assistant"));
+        expected.extend_from_slice(&t.encode("\n"));
+        assert_eq!(got, expected);
+
+        // The single-turn builder is what VL used to call: it keeps only the
+        // spliced turn. Guard the difference explicitly.
+        let single = frame.build_with_user_tokens(&body);
+        assert!(
+            got.len() > single.len(),
+            "multi-turn frame must carry more than the image turn alone"
+        );
+    }
+
+    /// An image on an EARLIER turn keeps the turns that follow it.
+    #[test]
+    fn splicing_builder_handles_image_in_earlier_turn() {
+        let t = make_tokenizer();
+        let history: [(Role, &str); 3] = [
+            (Role::User, "what colour is this?"),
+            (Role::Assistant, "red"),
+            (Role::User, "and what did I ask first?"),
+        ];
+        let body = t.encode("VISUAL");
+        let frame = ChatFrame {
+            tokenizer: &t,
+            system: None,
+            user: "",
+            assistant_prefix: AssistantPrefix::Plain,
+            raw: false,
+        };
+        let got = frame.build_multi_turn_splicing_user_tokens(&history, 0, &body);
+
+        let mut expected: Vec<u32> = Vec::new();
+        expect_turn(&mut expected, &t, "user", &body);
+        expect_turn(&mut expected, &t, "assistant", &t.encode("red"));
+        expect_turn(
+            &mut expected,
+            &t,
+            "user",
+            &t.encode("and what did I ask first?"),
+        );
+        expected.extend_from_slice(&t.encode("<|im_start|>"));
+        expected.extend_from_slice(&t.encode("assistant"));
+        expected.extend_from_slice(&t.encode("\n"));
+        assert_eq!(got, expected);
+    }
+
+    /// Out-of-range splice still yields a well-formed prompt: the tokens land
+    /// as a trailing user turn rather than vanishing.
+    #[test]
+    fn splicing_builder_out_of_range_appends_trailing_turn() {
+        let t = make_tokenizer();
+        let history: [(Role, &str); 1] = [(Role::User, "earlier")];
+        let body = t.encode("VISUAL");
+        let frame = ChatFrame {
+            tokenizer: &t,
+            system: None,
+            user: "",
+            assistant_prefix: AssistantPrefix::Plain,
+            raw: false,
+        };
+        let got = frame.build_multi_turn_splicing_user_tokens(&history, 99, &body);
+
+        let mut expected: Vec<u32> = Vec::new();
+        expect_turn(&mut expected, &t, "user", &t.encode("earlier"));
+        expect_turn(&mut expected, &t, "user", &body);
+        expected.extend_from_slice(&t.encode("<|im_start|>"));
+        expected.extend_from_slice(&t.encode("assistant"));
+        expected.extend_from_slice(&t.encode("\n"));
+        assert_eq!(got, expected);
     }
 
     #[test]

@@ -181,6 +181,15 @@ pub struct GenerateVLParams<'a> {
     pub assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
     /// Per-request sampler seed (see `hipfire_engine::request_seed_for`).
     pub seed: u32,
+    /// Full conversation as sent by the gateway, oldest first. When present the
+    /// prompt is framed over the WHOLE conversation and the image's visual run
+    /// is spliced into the turn at `image_message_index`, so prior turns and
+    /// the system prompt survive an image request. `None` keeps the legacy
+    /// single-turn framing (`hipfire run --image`, raw JSONL clients).
+    pub messages: Option<&'a [hipfire_runtime::prompt_frame::Message]>,
+    /// Index into `messages` of the turn that carried the image. `None`, or an
+    /// out-of-range value, falls back to the last user turn.
+    pub image_message_index: Option<usize>,
 }
 
 pub fn vl_no_eviction_kv_cap(physical_cap: usize, max_seq: usize, adaptive_engaged: bool) -> usize {
@@ -664,6 +673,8 @@ pub fn generate_vl(
         max_think_tokens,
         assistant_prefix,
         seed,
+        messages,
+        image_message_index,
     } = *params;
     // hunt3 M-E: seed the process-global CPU sampler RNG per request. The VL
     // path samples exclusively via sampler::sample_cpu, which draws from this
@@ -802,7 +813,20 @@ pub fn generate_vl(
     let system_est = system_prompt
         .map(|s| tokenizer.encode(s).len())
         .unwrap_or(0);
-    let prompt_est = tokenizer.encode(prompt).len() + system_est + n_visual_tokens + 20;
+    // Prior turns are re-prefilled on every VL request (the daemon force-resets
+    // seq_pos), so they belong in the estimate — without them a long
+    // conversation slips past the soft check and only fails after the vision
+    // encoder has already run. +8/turn covers the ChatML scaffolding.
+    let history_est = messages
+        .map(|history| {
+            history
+                .iter()
+                .map(|entry| tokenizer.encode(&entry.content).len() + 8)
+                .sum::<usize>()
+        })
+        .unwrap_or(0);
+    let prompt_est =
+        tokenizer.encode(prompt).len() + system_est + history_est + n_visual_tokens + 20;
 
     if m.eviction.is_none()
         && m.seq_pos
@@ -900,7 +924,38 @@ pub fn generate_vl(
     // prefill — failing earlier saves the round-trip on over-budget requests.
     let nl = tokenizer.encode("\n");
     let im_end = tokenizer.encode("<|im_end|>");
-    let q_tokens = tokenizer.encode(prompt);
+
+    // Conversation framing. A VL request always prefills from a clean KV -- the
+    // daemon force-resets `seq_pos` before dispatching here -- so the whole
+    // conversation is re-framed on every image turn rather than continued from
+    // cached state. Without this the frame covered ONE turn and every prior
+    // turn (and the system prompt) was silently dropped, so an agent lost its
+    // entire context the moment it attached an image.
+    let vl_history: Vec<(hipfire_runtime::prompt_frame::Role, &str)> = messages
+        .map(|history| {
+            history
+                .iter()
+                .map(|entry| (entry.role, entry.content.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+    // Splice the visual run into the turn the gateway flagged; fall back to the
+    // last user turn, which is where an OpenAI-shaped client puts the image it
+    // is asking about.
+    let splice_at = image_message_index
+        .filter(|&index| index < vl_history.len())
+        .or_else(|| {
+            vl_history
+                .iter()
+                .rposition(|(role, _)| matches!(role, hipfire_runtime::prompt_frame::Role::User))
+        });
+    // That turn's own text. `prompt` (the gateway's flattened last-user text)
+    // remains the single-turn fallback for `hipfire run --image`.
+    let turn_text = splice_at
+        .and_then(|index| vl_history.get(index))
+        .map(|(_, content)| *content)
+        .unwrap_or(prompt);
+    let q_tokens = tokenizer.encode(turn_text);
 
     let mut user_body: Vec<u32> = Vec::with_capacity(n_visual_tokens + q_tokens.len() + 4);
     user_body.push(vision_start_id);
@@ -911,14 +966,29 @@ pub fn generate_vl(
     user_body.extend_from_slice(&nl);
     user_body.extend_from_slice(&q_tokens);
 
-    let prompt_tokens = hipfire_runtime::prompt_frame::ChatFrame {
+    // Both builders emit the same ChatML scaffolding and the same assistant
+    // prefix, so `started_in_think` (computed from `assistant_prefix` above)
+    // stays accurate, and the pad run remains a single contiguous span --
+    // which is all `build_vl_mrope_ctx` requires of its position.
+    let frame = hipfire_runtime::prompt_frame::ChatFrame {
         tokenizer,
-        system: if m.seq_pos == 0 { system_prompt } else { None },
-        user: "", // unused: we pass tokens directly via build_with_user_tokens
+        // A System turn inside `vl_history` renders in place, so the separate
+        // `system` slot is used only for the historyless single-turn call.
+        system: if m.seq_pos == 0 && vl_history.is_empty() {
+            system_prompt
+        } else {
+            None
+        },
+        user: "", // unused: the turn body is passed as tokens
         assistant_prefix,
         raw: false,
-    }
-    .build_with_user_tokens(&user_body);
+    };
+    let prompt_tokens = match splice_at {
+        Some(index) if !vl_history.is_empty() => {
+            frame.build_multi_turn_splicing_user_tokens(&vl_history, index, &user_body)
+        }
+        _ => frame.build_with_user_tokens(&user_body),
+    };
 
     // KV-budget guard — tier-aware without eviction, absolute window with.
     // Adaptive admits against max_seq (floor-tier guarantee); non-adaptive keeps
