@@ -538,8 +538,26 @@ pub(crate) fn build_vl_mrope_ctx(
     // ever moved, weakened, or bypassed by a new VL entry point, we fail loudly
     // to the 1D path instead of silently mis-positioning every token after the
     // image.
+    // `base` must be the MROPE CURSOR, not the token count. They diverge as
+    // soon as the conversation contains an image: a span consumes `len` token
+    // slots but advances the cursor by only one grid dimension. The live
+    // caller passes `m.seq_pos` (a token count), which is sound ONLY because
+    // the daemon force-resets it to 0 before every VL dispatch, so `base` is
+    // always 0 here.
+    //
+    // `mrope::cursor_at_token()` computes the real cursor and is proven
+    // against `build_mrope_positions` at every span boundary
+    // (`cursor_agrees_with_builder_at_every_boundary`). The batched kernel's
+    // `pos_offset` is proven bit-identical to 1D rope at non-zero offsets
+    // (`test_mrope_rope_parity_batched`). So resuming mid-conversation is
+    // ready on both sides -- what is missing is a caller that passes the
+    // cursor instead of the token count. Until then this bails rather than
+    // silently mis-positioning every token after the image, which is what
+    // passing a token count as a cursor would do.
     if base > 0 {
-        return bail("base > 0: cross-turn mrope cursor continuity not modelled");
+        return bail(
+            "base > 0: caller must pass mrope::cursor_at_token(), not seq_pos              (see the note above this guard)",
+        );
     }
     let Some(start) = prompt_ids.iter().position(|&t| t == image_pad_id) else {
         // The daemon splices these pads itself a few lines above the call
@@ -1039,6 +1057,12 @@ pub fn generate_vl(
             grid_h,
             grid_w,
             vision_config.spatial_merge_size,
+            // Token count standing in for the mrope cursor. Valid only while
+            // the daemon force-resets seq_pos to 0 before VL dispatch; when
+            // that reset goes, this must become `mrope::cursor_at_token()` for
+            // the retained prefix, or every token after an earlier image is
+            // mis-positioned. The guard in `build_vl_mrope_ctx` fails closed
+            // in the meantime.
             m.seq_pos,
             config,
         )

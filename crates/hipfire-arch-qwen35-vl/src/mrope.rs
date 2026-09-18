@@ -108,6 +108,61 @@ pub fn build_mrope_positions(
     }
 }
 
+/// Position cursor after the first `upto` TOKENS of a prompt.
+///
+/// Token index and position are two coordinate systems: a text token consumes
+/// one of each, but an image span consumes `len` token slots while advancing
+/// the cursor by only one grid dimension (see [`build_mrope_positions`]). This
+/// converts the former to the latter, so a prefill that RESUMES at token
+/// `upto` can be positioned correctly.
+///
+/// Deliberately a pure function of the request rather than state carried on
+/// the conversation. The full prompt — image spans included — is rebuilt on
+/// every VL request, so the cursor is always derivable; storing it would add a
+/// field that 76 `conversation_tokens.clear()` sites would each have to
+/// remember to reset, and a missed one mis-positions every token after the
+/// image with no error. This mirrors llama.cpp's `pos_from_tokens()`.
+///
+/// `spans` must be sorted by `start` and non-overlapping, as
+/// [`build_mrope_positions`] requires.
+pub fn cursor_at_token(upto: usize, spans: &[ImageSpan], spatial_merge_size: usize) -> i32 {
+    assert!(
+        spatial_merge_size > 0,
+        "spatial_merge_size must be positive"
+    );
+    let mut cursor: i32 = 0;
+    let mut tok = 0usize;
+
+    for span in spans {
+        if span.start >= upto {
+            break;
+        }
+        // Text run before this image.
+        while tok < span.start {
+            cursor += 1;
+            tok += 1;
+        }
+        // A partially-consumed image span cannot be resumed: the cursor is
+        // only defined at span boundaries, so a prefix match must never cut
+        // one in half. Callers truncate to the span start instead.
+        debug_assert!(
+            span.start + span.len <= upto,
+            "cursor_at_token({upto}) splits an image span at {}..{}",
+            span.start,
+            span.start + span.len,
+        );
+        cursor += (span.grid_h.max(span.grid_w) / spatial_merge_size) as i32;
+        tok += span.len;
+    }
+
+    // Trailing text run.
+    while tok < upto {
+        cursor += 1;
+        tok += 1;
+    }
+    cursor
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,6 +269,87 @@ mod tests {
                 "cursor must compose across the seam"
             );
         }
+    }
+
+    /// `cursor_at_token` must agree with `build_mrope_positions` at the end of
+    /// the prompt, and at every span boundary in between. These are two
+    /// independent walks of the same structure; if they ever disagree, a
+    /// resumed prefill positions its first token wrong and everything after
+    /// the image is skewed -- silently.
+    #[test]
+    fn cursor_agrees_with_builder_at_every_boundary() {
+        let merge = 2;
+        for (pre, (gh, gw), mid, (gh2, gw2), post) in [
+            (
+                5usize,
+                (16usize, 16usize),
+                7usize,
+                (8usize, 12usize),
+                3usize,
+            ),
+            (0, (8, 8), 1, (16, 32), 11),
+            (40, (32, 16), 0, (8, 8), 9),
+        ] {
+            let a = span(pre, gh, gw, merge);
+            let b_start = pre + a.len + mid;
+            let b = span(b_start, gh2, gw2, merge);
+            let n = b_start + b.len + post;
+            let spans = [a, b];
+
+            let built = build_mrope_positions(n, &spans, merge);
+
+            // End of prompt: the cursor is max_pos + 1, which rope_delta
+            // encodes relative to the token count.
+            assert_eq!(
+                cursor_at_token(n, &spans, merge),
+                next_cursor(&built, n),
+                "end-of-prompt cursor must match rope_delta",
+            );
+
+            // Every boundary: the cursor equals the position the next token
+            // takes, which the builder wrote for that token.
+            for boundary in [pre, pre + a.len, b_start, b_start + b.len] {
+                if boundary >= n {
+                    continue;
+                }
+                assert_eq!(
+                    cursor_at_token(boundary, &spans, merge),
+                    built.positions[boundary][0],
+                    "cursor at token {boundary} must equal that token's t-axis position",
+                );
+            }
+        }
+    }
+
+    /// Resuming at a boundary reproduces one-shot framing -- the same property
+    /// `concatenation_equals_continuation` proves for positions, now driven by
+    /// the cursor a resumed prefill would actually compute.
+    #[test]
+    fn cursor_drives_exact_resumption() {
+        let merge = 2;
+        let img = span(6, 16, 16, merge);
+        let n = 6 + img.len + 9;
+        let spans = [img];
+        let whole = build_mrope_positions(n, &spans, merge);
+
+        // Resume from just before the image: prefix is pure text.
+        let resume_at = 6usize;
+        let base = cursor_at_token(resume_at, &spans, merge);
+        assert_eq!(base, 6, "six text tokens consume six positions");
+
+        let tail_span = span(0, 16, 16, merge);
+        let tail = build_mrope_positions(n - resume_at, std::slice::from_ref(&tail_span), merge);
+        let stitched: Vec<[i32; 3]> = tail
+            .positions
+            .iter()
+            .map(|p| [p[0] + base, p[1] + base, p[2] + base])
+            .collect();
+
+        assert_eq!(
+            stitched,
+            whole.positions[resume_at..],
+            "a prefill resumed at the cursor must match one-shot framing",
+        );
     }
 
     /// The frequency-to-axis map is interleaved `[THWTHW...TT]`, not chunked.
