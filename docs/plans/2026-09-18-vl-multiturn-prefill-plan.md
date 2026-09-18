@@ -399,13 +399,42 @@ Task 3.
 **Files:** `crates/hipfire-generate/src/vision.rs`,
 `crates/hipfire-arch-qwen35/src/dflash_spec.rs`.
 
-**Do:** `seed_target_hidden_from_prompt` cannot be reused — it re-prefills from
-token ids. Add a seeding entry point that takes hidden states *already captured*
-during the VL prefill: pass `Some(hidden_rb)` to the Task 2 batched call (the
-parameter already exists), then seed the speculator from those rows instead of
-re-running the target. Then route `generate_vl`'s decode through
-`spec.step` like the text path, keeping the AR loop as fallback when
-`m.speculator` is `None`.
+**Design, derived from the code (2026-09-18):**
+
+`DflashSpeculator::prefill` is already two separable phases:
+
+1. `seed_target_hidden_from_prompt_abortable(...)` — runs the TARGET forward
+   over `prefill_tokens`, capturing hidden states into `self.df.hidden_rb`.
+   **This is the only token-based phase, and the only one VL cannot reuse**,
+   because image positions are embeddings with no token spelling.
+2. `scatter_hidden_block_to_interleaved(gpu, &self.df.hidden_rb,
+   &self.df.draft_scratch.target_hidden, ...)` — primes the drafter purely
+   from those captured rows. **Provenance-agnostic**, so it works unchanged
+   for a VL prefill.
+
+So VL substitutes its own phase 1 and reuses phase 2 verbatim. Two additive
+trait methods, both with defaults so no other `Speculator` impl changes:
+
+```rust
+fn hidden_rb_mut(&mut self) -> Option<&mut HiddenStateRingBuffer> { None }
+fn prime_from_hidden(&mut self, gpu: &mut Gpu, prompt_len: usize)
+    -> Result<(), String> { Err("unsupported".into()) }
+```
+
+`generate_vl` then borrows the ring buffer out of the speculator, passes it as
+the `hidden_rb` argument of the Task 3 batched call (**the parameter already
+exists and is currently `None`**), and calls `prime_from_hidden` afterwards.
+
+**The remaining bulk is the decode loop, not the seeding.** `generate_vl` has a
+bespoke AR decode loop carrying think-routing (`<think>`/`</think>` pairing and
+force-close), the emit contract, abort polling, eviction and adaptive
+downshift. Routing it through `spec.step` means re-expressing all of that on
+the speculator's acceptance-window model. The risk here is NOT performance —
+it is silently changing reasoning-channel splitting or stop handling, which
+shows up as malformed output rather than an error. Budget for a reference test
+comparing emitted channels token-for-token against the AR path before switching
+the default, and keep the AR loop as the fallback when `m.speculator` is
+`None`.
 
 **Done when:** image turns report `dflash: true` in `timings` with decode ≥ 100
 tok/s, and greedy output is byte-identical to the AR path (DFlash verification
