@@ -12,7 +12,7 @@ use super::config::DflashFusionCtx;
 use super::config::LayerType;
 use super::config::Qwen35Config;
 use super::config::TreeVerifyCtx;
-use super::config::{MaskEmbedOverride, MropeBatch};
+use super::config::{MaskEmbedOverride, MropeBatch, MropeCtx};
 use super::forward::checked_kv_end;
 use super::forward::forward_scratch;
 use super::forward::forward_scratch_with_hidden;
@@ -1338,6 +1338,30 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                     dn_state,
                     scratch,
                     rb,
+                )?;
+            } else if let Some(mb) = mrope {
+                // The batched path is where M-RoPE is normally applied, but
+                // eligibility can send a small batch here instead -- `n == 1`
+                // always does, since MIN_BATCH is 2, and a verify with
+                // accept_len == 0 is exactly that. Dropping the positions here
+                // would rotate at plain `pos` and produce fluent-looking
+                // corruption with no error, so route to the per-token mrope
+                // forward rather than the plain one.
+                //
+                // `MropeCtx::pos3` indexes `positions[pos - base]`, so basing
+                // at `start_pos` reproduces `mb.positions[i]` exactly, and
+                // `pos_offset` carries through as the decode-step delta.
+                let ctx = MropeCtx::new(config, start_pos, mb.positions.to_vec(), mb.pos_offset);
+                super::forward::forward_scratch_mrope(
+                    gpu,
+                    weights,
+                    config,
+                    tok,
+                    start_pos + i,
+                    kv_cache,
+                    dn_state,
+                    scratch,
+                    Some(&ctx),
                 )?;
             } else {
                 // One-shot: mark this forward AR-graph-eligible iff it's plain

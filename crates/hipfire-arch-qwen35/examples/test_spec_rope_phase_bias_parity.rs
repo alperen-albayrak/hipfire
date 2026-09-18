@@ -59,7 +59,8 @@ fn seed(gpu: &mut Gpu, slot: &mut ModelSlot, prompt: &[u32]) {
 }
 
 fn logits(gpu: &mut Gpu, slot: &ModelSlot) -> Vec<f32> {
-    gpu.download_f32(&slot.scratch.logits).expect("download logits")
+    gpu.download_f32(&slot.scratch.logits)
+        .expect("download logits")
 }
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
@@ -96,8 +97,16 @@ fn main() {
 
     // rope_delta values a real image produces: -56 is one 64x64 image (64
     // visual tokens collapsing to an 8-wide grid advance); -184 approximates a
-    // 512x512. 0 is the control that must hit the delegation arm.
-    for delta in [0i32, -56, -184, 37] {
+    // 512x512. +37 is a sign check.
+    //
+    // 0 is deliberately NOT in this sweep. At bias 0 the wrapper DELEGATES to
+    // the plain forward, so comparing it against a mrope forward pits the 1-D
+    // route against the mrope route -- two different execution paths whose
+    // float reduction order differs by ~7.5e-3. That is a route difference,
+    // not a phase error, and asserting bit-identity across it would be a
+    // meaningless failure. The delegation arm gets its own like-for-like
+    // check below.
+    for delta in [-56i32, -184, 37] {
         // ── A. what the AR VL decode loop does ──────────────────────────
         seed(&mut gpu, &mut slot, &prompt);
         let mrope = MropeCtx::new(&slot.config, 0, Vec::new(), delta);
@@ -142,6 +151,51 @@ fn main() {
         if !ok {
             failures += 1;
         }
+    }
+
+    // ── Delegation arm, compared like-for-like ──────────────────────────
+    // bias 0 must be byte-identical to calling the plain forward directly.
+    // This is what keeps every TEXT request unchanged, so it is worth its own
+    // assertion rather than being inferred.
+    seed(&mut gpu, &mut slot, &prompt);
+    qwen35::forward_prefill_batch_rope_biased(
+        &mut gpu,
+        &slot.weights,
+        &slot.config,
+        &[next_token],
+        p,
+        &mut slot.kv_cache,
+        &mut slot.dn_state,
+        &slot.scratch,
+        None,
+        0,
+    )
+    .expect("bias 0");
+    let via_wrapper = logits(&mut gpu, &slot);
+
+    seed(&mut gpu, &mut slot, &prompt);
+    qwen35::forward_prefill_batch(
+        &mut gpu,
+        &slot.weights,
+        &slot.config,
+        &[next_token],
+        p,
+        &mut slot.kv_cache,
+        &mut slot.dn_state,
+        &slot.scratch,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("plain");
+    let via_plain = logits(&mut gpu, &slot);
+
+    let deleg = max_abs_diff(&via_wrapper, &via_plain);
+    println!("delegation: max|dlogit| bias-0 vs plain forward = {deleg:.3e}");
+    if deleg != 0.0 {
+        println!("  MISMATCH: bias 0 must delegate VERBATIM — text paths would drift.");
+        failures += 1;
     }
 
     // ── Control: the bias must actually MATTER ──────────────────────────
