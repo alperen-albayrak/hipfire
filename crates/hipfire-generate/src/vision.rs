@@ -1337,143 +1337,148 @@ pub fn generate_vl(
     // advance m.seq_pos in-loop and call maybe_evict / maybe_downshift after
     // every committed write. Lazy VMM map/growth failures and adaptive
     // transition errors are request-scoped (no panic, no later token emit).
-    // Batched prefill. This replaces a per-token loop that ran at ~33 tok/s
-    // because `forward_scratch_embed_mrope` is one kernel launch per token,
-    // against ~630 tok/s for the batched text path on the same hardware. The
-    // visual rows go in as a contiguous embedding-span override and the 3-axis
-    // positions as an `MropeBatch`, so the work is identical -- only the
-    // launch granularity changes.
+    // Batched prefill, ONE call for the whole prompt. Replaces a per-token
+    // loop that ran at ~33 tok/s because `forward_scratch_embed_mrope` is one
+    // kernel launch per token, against ~630 tok/s for the batched text path.
     //
-    // Chunked HERE as well as internally so client cancellation still lands
-    // between chunks. The per-token loop polled every token; dropping the poll
-    // entirely strands the serve admission guard on a mid-prefill disconnect
-    // (2026-08-27 ledger finding c, slot wedged >= 3 min).
-    const VL_PREFILL_ABORT_CHUNK: usize = 1024;
+    // Deliberately NOT chunked out here. `forward_prefill_batch` already
+    // chunks internally, and that loop is the only place that can slice the
+    // mrope positions and the embedding-span override per chunk AND commit
+    // the hidden-state ring (`rb.commit_staging_to_ring`, prefill.rs) at the
+    // right head. Chunking externally would re-seed the ring head from zero
+    // on every call and hand the drafter misaligned rows -- which does not
+    // fail loudly, it just drafts badly. Abort granularity is preserved by
+    // the cooperative `abort` callback the internal loop polls between
+    // chunks, so a mid-prefill disconnect still lands (2026-08-27 ledger
+    // finding c) without the caller owning the ring.
+    //
+    // `hidden_rb` is the DFlash drafter's own ring when a DFlash speculator is
+    // resident: the target's hidden states for THIS prompt -- image rows
+    // included -- are captured as a side effect of the prefill we are already
+    // running, and `prime_from_hidden` below seeds the drafter from them
+    // without re-running the target over token ids (which cannot reproduce a
+    // VL prompt).
     let image_span_start = prompt_tokens.iter().position(|&t| t == image_pad_id);
-    let mut off = 0usize;
-    while off < prompt_tokens.len() {
-        if check_abort(id) {
-            // Abort with uncommitted prefill state: roll back through the
-            // canonical epilogue before the cancelled pair so the next
-            // request re-prefills from clean state (no deferred reset).
-            vl_cancel_after_rollback(
-                stdout,
-                id,
-                0,
-                gpu,
-                dn,
-                kv,
-                &mut m.kv_adaptive,
-                &mut m.seq_pos,
-                &mut m.conversation_tokens,
-                &mut m.prefill_checkpoints,
-                &mut m.dflash_checkpoints,
-                &mut m.asst_turn_cache,
-                &mut m.speculator,
-            );
-            return;
-        }
-        let end = (off + VL_PREFILL_ABORT_CHUNK).min(prompt_tokens.len());
-        let toks = &prompt_tokens[off..end];
-        // Visual rows intersecting this chunk, rebased to chunk-local slots.
-        // The span is contiguous, so this is a slice, not a gather.
-        let overrides = image_span_start.and_then(|st| {
-            let lo = st.max(off);
-            let hi = (st + n_visual_tokens).min(end);
-            (lo < hi).then(|| qwen35::MaskEmbedOverride {
-                slot: lo - off,
-                embed: &visual_tokens[(lo - st) * config.dim..(hi - st) * config.dim],
-            })
-        });
-        // `MropeCtx.positions` is already absolute (offset by `base`), so the
-        // kernel needs no further offset. `None` here keeps the scalar 1-D
-        // path, which is what a bailed mrope context must fall back to.
-        let mrope_batch = mrope.map(|mc| qwen35::MropeBatch {
-            positions: &mc.positions[off..end],
-            pos_offset: 0,
-            section: mc.section,
-        });
-        if let Err(e) = qwen35::forward_prefill_batch_with_pbs_opts(
-            gpu,
-            weights,
-            config,
-            toks,
-            m.seq_pos,
-            kv,
-            dn,
-            scratch,
-            None, // hidden_rb
-            None, // per_token_hidden_out
-            None, // gdn_tape
-            None, // tree_verify
-            None, // pbs_in: use the resident scratch
-            overrides,
-            None,  // max_layer
-            false, // needs_last_token_logits
-            qwen35::DflashFusionCtx::Off,
-            mrope_batch,
-        ) {
-            vl_forward_fail(
-                stdout,
-                id,
-                "forward_prefill_batch (vl prefill)",
-                e,
-                gpu,
-                dn,
-                kv,
-                &mut m.kv_adaptive,
-                &mut m.seq_pos,
-                &mut m.conversation_tokens,
-                &mut m.prefill_checkpoints,
-            );
-            return;
-        }
-        m.seq_pos += toks.len();
-        if let Some(ref ev) = m.eviction {
-            match ev.maybe_evict(gpu, kv, m.seq_pos) {
-                Ok(Some(hipfire_runtime::triattn::EvictionResult {
-                    new_physical: new_phys,
-                    ..
-                })) => {
-                    m.seq_pos = new_phys;
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    vl_forward_fail(
-                        stdout,
-                        id,
-                        "maybe_evict (prefill)",
-                        e,
-                        gpu,
-                        dn,
-                        kv,
-                        &mut m.kv_adaptive,
-                        &mut m.seq_pos,
-                        &mut m.conversation_tokens,
-                        &mut m.prefill_checkpoints,
-                    );
-                    return;
-                }
-            }
-        }
-        // Adaptive KV: downshift BETWEEN prefill tokens the moment the
-        // start-tier buffer fills so a long multi-chunk visual+text prompt
-        // cannot overflow current-stride capacity before decode begins.
-        if vl_adaptive_downshift_fail_closed(
-            &mut m.kv_adaptive,
-            &mut m.seq_pos,
-            gpu,
-            kv,
-            dn,
-            &mut m.conversation_tokens,
-            &mut m.prefill_checkpoints,
+    let overrides = image_span_start.map(|st| qwen35::MaskEmbedOverride {
+        slot: st,
+        embed: &visual_tokens[..n_visual_tokens * config.dim],
+    });
+    // `MropeCtx.positions` is already absolute (offset by `base`), so the
+    // kernel needs no further offset. `None` keeps the scalar 1-D path, which
+    // is what a bailed mrope context must fall back to.
+    let mrope_batch = mrope.map(|mc| qwen35::MropeBatch {
+        positions: &mc.positions,
+        pos_offset: 0,
+        section: mc.section,
+    });
+    // `hidden_rb` stays None until VL decode actually runs the drafter.
+    // Capturing hidden states costs staging writes plus a per-chunk ring
+    // commit, and `prime_from_hidden` costs a download, scatter and backfill
+    // — all wasted while decode is still AR. `DflashSpeculator::hidden_rb_mut`
+    // and `prime_from_hidden` are in place for that switch; this call site is
+    // where they get wired, via
+    // `sp.as_any_mut().downcast_mut::<DflashSpeculator>()`.
+    let prefill_res = qwen35::forward_prefill_batch_with_pbs_opts(
+        gpu,
+        weights,
+        config,
+        &prompt_tokens,
+        m.seq_pos,
+        kv,
+        dn,
+        scratch,
+        None, // hidden_rb: see the note above
+        None, // per_token_hidden_out
+        None, // gdn_tape
+        None, // tree_verify
+        None, // pbs_in: use the resident scratch
+        overrides,
+        None,  // max_layer
+        false, // needs_last_token_logits
+        qwen35::DflashFusionCtx::Off,
+        mrope_batch,
+        Some(&|| check_abort(id)),
+    );
+    if let Err(e) = prefill_res {
+        vl_forward_fail(
             stdout,
             id,
-            "vl-prefill",
-        ) {
-            return;
+            "forward_prefill_batch (vl prefill)",
+            e,
+            gpu,
+            dn,
+            kv,
+            &mut m.kv_adaptive,
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+        );
+        return;
+    }
+    // The internal loop stops early on abort without reporting it, so the
+    // decision is re-made here and taken through the canonical epilogue.
+    if check_abort(id) {
+        vl_cancel_after_rollback(
+            stdout,
+            id,
+            0,
+            gpu,
+            dn,
+            kv,
+            &mut m.kv_adaptive,
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            &mut m.speculator,
+        );
+        return;
+    }
+    m.seq_pos += prompt_tokens.len();
+    if let Some(ref ev) = m.eviction {
+        match ev.maybe_evict(gpu, kv, m.seq_pos) {
+            Ok(Some(hipfire_runtime::triattn::EvictionResult {
+                new_physical: new_phys,
+                ..
+            })) => {
+                m.seq_pos = new_phys;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                vl_forward_fail(
+                    stdout,
+                    id,
+                    "maybe_evict (prefill)",
+                    e,
+                    gpu,
+                    dn,
+                    kv,
+                    &mut m.kv_adaptive,
+                    &mut m.seq_pos,
+                    &mut m.conversation_tokens,
+                    &mut m.prefill_checkpoints,
+                );
+                return;
+            }
         }
-        off = end;
+    }
+    // Adaptive KV: downshift BETWEEN prefill tokens the moment the
+    // start-tier buffer fills so a long multi-chunk visual+text prompt
+    // cannot overflow current-stride capacity before decode begins.
+    if vl_adaptive_downshift_fail_closed(
+        &mut m.kv_adaptive,
+        &mut m.seq_pos,
+        gpu,
+        kv,
+        dn,
+        &mut m.conversation_tokens,
+        &mut m.prefill_checkpoints,
+        stdout,
+        id,
+        "vl-prefill",
+    ) {
+        return;
     }
 
     m.conversation_tokens.extend_from_slice(&prompt_tokens);

@@ -117,6 +117,7 @@ fn main() {
             false,
             qwen35::DflashFusionCtx::Off,
             None,
+            None,
         )
         .expect("reference forward (bounded)");
         gpu.hip.device_synchronize().expect("sync ref");

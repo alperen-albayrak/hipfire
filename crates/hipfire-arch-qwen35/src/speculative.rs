@@ -3245,6 +3245,7 @@ fn verify_dflash_block_inner(
             false, // DFlash computes all verify logits from final_hidden below
             fusion,
             None,
+            None,
         )
     };
 

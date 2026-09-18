@@ -920,6 +920,7 @@ pub fn forward_prefill_batch_capped(
         Some(max_batch_cap),
         DflashFusionCtx::Off,
         None,
+        None,
     )
 }
 
@@ -959,6 +960,7 @@ pub fn forward_prefill_batch_with_pbs(
         max_layer,
         true, // preserve legacy post-condition: scratch.logits is last-token logits
         DflashFusionCtx::Off,
+        None,
         None,
     )
 }
@@ -1001,6 +1003,7 @@ pub fn forward_prefill_batch_with_pbs_opts(
     needs_last_token_logits: bool,
     fusion: DflashFusionCtx,
     mrope: Option<MropeBatch<'_>>,
+    abort: Option<&dyn Fn() -> bool>,
 ) -> HipResult<()> {
     forward_prefill_batch_with_pbs_opts_inner(
         gpu,
@@ -1022,6 +1025,7 @@ pub fn forward_prefill_batch_with_pbs_opts(
         None,
         fusion,
         mrope,
+        abort,
     )
 }
 
@@ -1046,6 +1050,7 @@ fn forward_prefill_batch_with_pbs_opts_inner(
     max_batch_cap: Option<usize>,
     fusion: DflashFusionCtx,
     mrope: Option<MropeBatch<'_>>,
+    abort: Option<&dyn Fn() -> bool>,
 ) -> HipResult<()> {
     // Plain single-token AR decode? Only then is the per-token `forward_scratch`
     // call below eligible for the AR-forward hipGraph (capture/replay). Any spec
@@ -1420,6 +1425,15 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                 fusion,
                 mrope_for_chunk,
             )?;
+            // Cooperative cancel BETWEEN chunks. Keeps the abort granularity
+            // the VL per-token loop used to provide, without making the caller
+            // chunk externally -- which would break `hidden_rb` accumulation,
+            // since the ring head is advanced by the commit just below.
+            // Stops work only; the caller re-checks its own abort flag and
+            // runs its rollback epilogue.
+            if abort.is_some_and(|f| f()) {
+                return Ok(());
+            }
             if let Some(rb) = hidden_rb.as_mut() {
                 // Scatter fixed-offset staging writes (done inside the chunk)
                 // to the ring at the current head, then advance head by n.
