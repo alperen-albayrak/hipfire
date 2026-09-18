@@ -959,6 +959,7 @@ pub fn forward_prefill_batch_with_pbs(
         max_layer,
         true, // preserve legacy post-condition: scratch.logits is last-token logits
         DflashFusionCtx::Off,
+        None,
     )
 }
 
@@ -999,6 +1000,7 @@ pub fn forward_prefill_batch_with_pbs_opts(
     max_layer: Option<usize>,
     needs_last_token_logits: bool,
     fusion: DflashFusionCtx,
+    mrope: Option<MropeBatch<'_>>,
 ) -> HipResult<()> {
     forward_prefill_batch_with_pbs_opts_inner(
         gpu,
@@ -1019,7 +1021,7 @@ pub fn forward_prefill_batch_with_pbs_opts(
         needs_last_token_logits,
         None,
         fusion,
-        None,
+        mrope,
     )
 }
 
@@ -1055,6 +1057,12 @@ fn forward_prefill_batch_with_pbs_opts_inner(
         && gdn_tape.is_none()
         && per_token_hidden_out.is_none()
         && hidden_rb.is_none()
+        // A VL chunk issues a DIFFERENT rope kernel against a different
+        // position buffer, so it is not plain AR and must not leave a
+        // captured graph a later text forward could replay. Mirrors the
+        // contract `mark_mrope_forward_ineligible` enforces on the per-token
+        // VL path.
+        && mrope.is_none()
         && tokens.len() == 1;
     // Upper bound on the PrefillBatchScratch — large prompts get split
     // into chunks of this size and processed in a loop.
@@ -1352,20 +1360,32 @@ fn forward_prefill_batch_with_pbs_opts_inner(
             // Apply mask_override only to the chunk that actually contains
             // its target slot, and rebase the slot index to chunk-local
             // coordinates. Out-of-range slots panic (caller error).
+            // A widened override (a VL visual span) can straddle chunks, so
+            // intersect it with this chunk and slice the rows to match rather
+            // than assuming it fits in one. Reduces to the original
+            // single-slot behaviour when the override is one row.
             let mo_for_chunk = mask_override.and_then(|ovr| {
-                if ovr.slot >= chunk_start && ovr.slot < chunk_end {
-                    Some(MaskEmbedOverride {
-                        slot: ovr.slot - chunk_start,
-                        embed: ovr.embed,
-                    })
-                } else {
-                    None
-                }
+                let rows = ovr.embed.len() / config.dim;
+                let (ovr_start, ovr_end) = (ovr.slot, ovr.slot + rows);
+                let lo = ovr_start.max(chunk_start);
+                let hi = ovr_end.min(chunk_end);
+                (lo < hi).then(|| MaskEmbedOverride {
+                    slot: lo - chunk_start,
+                    embed: &ovr.embed[(lo - ovr_start) * config.dim..(hi - ovr_start) * config.dim],
+                })
+            });
+            // M-RoPE positions are per-token, so they chunk with the tokens.
+            // `pos_offset` is chunk-invariant (the conversation cursor).
+            let mrope_for_chunk = mrope.map(|mb| MropeBatch {
+                positions: &mb.positions[chunk_start..chunk_end],
+                pos_offset: mb.pos_offset,
+                section: mb.section,
             });
             // Sanity: if caller provided an override, it MUST land in some
             // chunk. Detect "fell off the end" at the last chunk boundary.
             if mask_override.is_some() && chunk_end == n {
                 let landed_anywhere = mask_override.unwrap().slot < n;
+                // (a span starting in range always intersects some chunk)
                 assert!(
                     landed_anywhere,
                     "MaskEmbedOverride.slot ({}) is out of range for tokens.len() ({})",
@@ -1398,7 +1418,7 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                 max_layer,
                 None, // routed_out: non-EP single-GPU path
                 fusion,
-                mrope,
+                mrope_for_chunk,
             )?;
             if let Some(rb) = hidden_rb.as_mut() {
                 // Scatter fixed-offset staging writes (done inside the chunk)
