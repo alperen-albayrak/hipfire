@@ -509,6 +509,45 @@ bias that must never reach slot indices.
 Do not wire the loop before (1): without the bias the change is actively
 wrong, not merely ineffective.
 
+### Decode-loop implementation map (surveyed 2026-09-18)
+
+Everything below is located, so the port starts without rediscovery.
+
+**The AR loop to mirror** lives in `generate_vl`, roughly lines 1610-1953 of
+`vision.rs`. Its hot forward is the single `forward_scratch_mrope` at ~1661.
+The think force-close is nested INSIDE the loop (~1817, 24-space indent); the
+ChatML `\n` boundary-sync forward is in the EPILOGUE, after the loop ends
+(~1960). Only the hot forward is replaced by `spec.step`; the other two stay
+per-token and occasional.
+
+**A working VL + speculator template already exists in the same file**:
+`decode_vl_dots_ocr_ngram` (~2550) and `run_dots_ocr_ngram_loop` (~2576),
+the dots-ocr n-gram path. Its shape is the one to copy — take the bundle and
+the speculator OUT of `m` (disjoint fields), run a dedicated loop that never
+touches `m`, then restore both. Its guard comment is worth reading: the
+prefill bindings must be released first so the branch can take `&mut m`.
+
+**Getting a `SpecTarget` for qwen35** differs from dots-ocr, whose bundle IS
+the target. Here: `Qwen35SlotGuard::take(&mut m.state, &m.model_path)` returns
+an RAII guard; `.slot()` yields `&mut dyn SpecTarget`; `Drop` converts the slot
+back into the bundle and restores it. `ModelSlot` already carries
+`vision_config` / `vision_weights` so a VL bundle round-trips without loss.
+
+**Seeding.** The dots-ocr loop primes with
+`spec.prefill(cache_hit = true, empty suffix)`, which skips the target advance
+and just argmaxes the live vision-conditioned state. That is enough for n-gram,
+which keeps no hidden state — but NOT for DFlash, whose drafter needs the
+prompt's hidden rows. For DFlash: pass the drafter's ring as `hidden_rb` to the
+VL prefill (the parameter is already there, currently `None`, with the call
+site noted), then `prime_from_hidden`.
+
+**Set the bias before stepping**: `target.set_rope_phase_bias(rope_delta)` from
+the request's `MropeCtx`, or every decode token rotates at the wrong phase.
+
+**Gate it.** Land behind an env flag defaulting OFF (the repo gates
+`HIPFIRE_JINJA_CHAT`, `HIPFIRE_DFLASH_VERIFY_PM4`, `vision_mode` the same way),
+so the port is reviewable and measurable without changing default behaviour.
+
 **The remaining bulk is the decode loop, not the seeding.** `generate_vl` has a
 bespoke AR decode loop carrying think-routing (`<think>`/`</think>` pairing and
 force-close), the emit contract, abort polling, eviction and adaptive
