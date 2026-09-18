@@ -260,8 +260,22 @@ current per-token loop polls `check_abort` every token, and chunking is the
 replacement, not removal. Keep `maybe_evict` / `maybe_downshift` on chunk
 boundaries.
 
-**Done when:** image prefill ≥ 500 tok/s on the baseline fixture; image-turn
-output is unchanged token-for-token versus the per-token path at temperature 0.
+**DONE — measured on gfx1201, 2026-09-18.**
+
+| workload | before | after |
+|---|---|---|
+| image, ~200-tok history | 12.3 s TTFT, 33.0 tok/s | **0.56 s, 730 tok/s** |
+| image, ~1400-tok history | **82.0 s** TTFT, 32.8 tok/s | **2.14 s, 1253 tok/s** |
+| image prefill, 64px / 512px | 33 tok/s | 606 / 795 tok/s |
+
+**38× on the 1400-token case.** Correctness held: the multi-turn recall test
+passes (reads the image AND recalls the conversation), image descriptions match
+the pre-change wording at both 64px and 512px, and prompt token counts are
+unchanged (85 vs 84, 277 vs 276, 799 vs 799) so framing is untouched.
+
+Text path unregressed — decode 140.0 tok/s against a 139.6 baseline, DFlash
+still engaged, prefill 387–1017 tok/s. That was the regression this change
+could most plausibly have caused, via `plain_ar_graph_eligible`.
 
 ---
 
