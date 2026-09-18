@@ -587,6 +587,48 @@ per-token float difference, not the correctness of this change.
 `HIPFIRE_JINJA_CHAT`, `HIPFIRE_DFLASH_VERIFY_PM4`, `vision_mode` the same way),
 so the port is reviewable and measurable without changing default behaviour.
 
+### STATUS 2026-09-18: wired, gated, and FAULTING — do not enable
+
+`HIPFIRE_VL_DFLASH=1` faults the GPU on gfx1201:
+
+    Memory access fault by GPU node-1 ... Reason: Page not present
+
+Twice, reproducibly. The gate contained it both times: default-off meant only
+the explicit opt-in was affected, and after restarting without it the whole
+suite is byte-identical to the pre-change baseline on all five cases.
+
+**The fault is in PREFILL, not in priming or decode.** The daemon log ends:
+
+    [daemon/vl] mrope: span start=4 ... rope_delta=-56
+      vision done: 64 tokens x 5120 dims
+    Memory access fault by GPU node-1 ...
+
+No `dflash prime` or `dflash decode` line is ever reached. So the failing step
+is `forward_prefill_batch` with `hidden_rb = Some(drafter ring)` — the hidden
+capture itself — on a prompt of only ~85 tokens.
+
+A first hypothesis (missing `reset_upload_tracking` / `last_window` in
+`prime_from_hidden`, which `prefill` does and `prime_from_hidden` omitted) was
+a REAL gap and is fixed, but it was not this fault: priming never runs.
+
+**Where to look next, not yet investigated:**
+
+- `seed_target_hidden_from_prompt` passes `&mut self.df.hidden_rb` to
+  `forward_prefill_batch` with the target as a **`ModelSlot`** — its own
+  `weights` / `config` / `kv_cache` / `dn_state` / `scratch`. The VL path
+  passes the **bundle's** scratch instead. If the ring's staging expects a
+  scratch sized for hidden capture, the bundle's is the wrong one.
+- `forward_prefill_batch`'s chunk sizing consults
+  `hidden_rb.as_ref().map(|rb| rb.max_batch)` (prefill.rs ~493, ~1336), and
+  the VL call passes `pbs_in: None` so the batch scratch is allocated
+  internally. Whether that allocation accounts for hidden staging is unchecked.
+
+**Do not brute-force this against the live server.** Each fault kills the
+daemon and needs a restart. Isolate it in a GPU example (as
+`test_spec_rope_phase_bias_parity` does) that runs one VL-shaped prefill with
+`hidden_rb = Some`, so the failure is reproducible without taking the service
+down.
+
 **The remaining bulk is the decode loop, not the seeding.** `generate_vl` has a
 bespoke AR decode loop carrying think-routing (`<think>`/`</think>` pairing and
 force-close), the emit contract, abort polling, eviction and adaptive
