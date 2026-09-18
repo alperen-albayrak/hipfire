@@ -326,9 +326,47 @@ different turn, and text-only, with no GPU.
 
 **Do:** Replace the unconditional `seq_pos > 0` reset with the text path's
 logic: compute the common prefix (Task 4), keep that KV, prefill only the
-suffix, and start it at `base = mrope_cursor` restored for the retained prefix.
-Retain the reset as the *fallback* for a prefix miss, and keep it unconditional
-under a kill switch (`HIPFIRE_VL_PREFIX_REUSE=0`) for one release.
+suffix. Retain the reset as the *fallback* for a prefix miss, and keep it
+unconditional under a kill switch (`HIPFIRE_VL_PREFIX_REUSE=0`) for one
+release.
+
+**Scope corrections from the code read (2026-09-18) — this task is bigger than
+written:**
+
+- **Reuse only on PURE EXTENSION (`lcp == prior_len`).** The text path's
+  decision (`ar.rs:~3290`) degrades to checkpoint-resume or cold reset for
+  `lcp < prior_len`, because **DeltaNet recurrent state cannot be partially
+  retained the way KV can** — it is restored from a `prefill_checkpoints`
+  snapshot, and the VL reset currently frees that ring. Accepting only pure
+  extension keeps the recurrent state exactly correct by construction (it is
+  the state after consuming precisely the retained tokens) and needs no
+  checkpoint machinery. It also covers the agent case, which is append-only.
+  Anything else must fall back to the full reset.
+
+- **The prefix will NOT match unless assistant turns are spliced from cached
+  token ids.** `continuation_suffix`'s doc states the reason: re-encoding a
+  decoded reply is "a detokenise/retokenise round trip that is not guaranteed
+  to be the identity". The VL framing added by the multi-turn fix re-renders
+  the whole conversation from `messages` every turn, so a re-encoded assistant
+  turn can differ from what generation actually produced, truncating `lcp`
+  before the new content and defeating reuse. The text path already solves
+  this: `asst_turn_fingerprint` + the assistant-turn cache splice the EXACT
+  generated ids back into rendered history (`ar.rs:~3150`). VL framing must go
+  through the same cache, or reuse will appear to work in tests using
+  synthetic histories and rarely hit in production.
+
+  This is the real dependency, and it means Task 5 is not "delete the reset" —
+  it is "give VL the text path's continuation machinery". Budget accordingly,
+  and prefer refactoring that machinery into something both paths call over
+  reimplementing it in `vision.rs`.
+
+- **Zero cursor arithmetic is needed for the pure-extension case.** Both turns
+  frame from 0 and share a prefix, so the absolute positions of shared tokens
+  are identical; the existing `MropeCtx` (built over the whole prompt, base 0)
+  can simply be indexed from the resume point. `cursor_at_token` stays valuable
+  as a cross-check and for any future partial-prefix work, but the first
+  implementation does not need `base > 0` at all — which is why the guard can
+  stay until then.
 
 **Done when:** an image request repeated byte-identically reports `cached > 0`
 and TTFT drops to roughly decode-start latency; extending a conversation by one
