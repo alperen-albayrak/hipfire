@@ -183,7 +183,10 @@ impl<D: BlockDrafter> ChainSpeculator<D> {
     }
 }
 
-impl<D: BlockDrafter> Speculator for ChainSpeculator<D> {
+impl<D: BlockDrafter + 'static> Speculator for ChainSpeculator<D> {
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
     fn name(&self) -> &'static str {
         "ngram"
     }

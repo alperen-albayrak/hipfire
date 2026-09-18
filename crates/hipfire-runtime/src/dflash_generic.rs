@@ -549,6 +549,9 @@ fn clamp_accept_to_budget(
 }
 
 impl Speculator for GenericDflashSpeculator {
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
     fn name(&self) -> &'static str {
         "dflash"
     }

@@ -668,6 +668,15 @@ pub trait Speculator {
     /// cursor). `resume_from`, when set, drops the drafter projection cursor to a
     /// divergent-render checkpoint position.
     #[allow(clippy::too_many_arguments)]
+    /// Downcast hook, mirroring [`SpecTarget::as_any_mut`].
+    ///
+    /// Arch-specific seeding (notably a VL prefill priming the DFlash drafter
+    /// from target hidden states it captured itself) needs the concrete
+    /// speculator. Those types live in the arch crates, which sit ABOVE this
+    /// one, so the trait cannot name them — the arch-aware caller downcasts
+    /// instead. Same reason `SpecTarget` carries this hook.
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
+
     fn prefill(
         &mut self,
         gpu: &mut Gpu,
@@ -1204,7 +1213,10 @@ fn mtp_draft_k(arch_k: usize, max_emit: usize) -> usize {
     max_emit.saturating_sub(1).min(arch_k)
 }
 
-impl<A: MtpDrafter> Speculator for MtpSpeculator<A> {
+impl<A: MtpDrafter + 'static> Speculator for MtpSpeculator<A> {
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
     fn name(&self) -> &'static str {
         self.arch.name()
     }

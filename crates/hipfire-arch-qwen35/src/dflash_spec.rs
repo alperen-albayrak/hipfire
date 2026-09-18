@@ -15,10 +15,10 @@ use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Weights, StateQuant
 use crate::speculative::{
     apply_eviction_retain_to_draft, apply_host_nucleus, apply_host_topk, sample_categorical,
     scatter_hidden_block_to_interleaved, seed_target_hidden_dense_tp2_abortable,
-    seed_target_hidden_from_prompt_abortable, seed_target_hidden_suffix_abortable, softmax_temp_into,
-    spec_step_ddtree_batched, spec_step_dflash, spec_step_dflash_dense_tp2, xorshift_next_unit,
-    DdtreeScratch, DeltaNetSnapshot, DenseTpTargetView, GdnTape, HiddenStateRingBuffer, ModelSlot,
-    SpecStepResult, VerifyScratch,
+    seed_target_hidden_from_prompt_abortable, seed_target_hidden_suffix_abortable,
+    softmax_temp_into, spec_step_ddtree_batched, spec_step_dflash, spec_step_dflash_dense_tp2,
+    xorshift_next_unit, DdtreeScratch, DeltaNetSnapshot, DenseTpTargetView, GdnTape,
+    HiddenStateRingBuffer, ModelSlot, SpecStepResult, VerifyScratch,
 };
 use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights, TargetHiddenLogMark};
 use hipfire_runtime::hfq::HfqFile;
@@ -599,7 +599,90 @@ impl DflashSpeculator {
     }
 }
 
+impl DflashSpeculator {
+    /// The ring buffer a caller-run prefill should write target hidden states
+    /// into, ahead of [`Self::prime_from_hidden`].
+    ///
+    /// Exists because a VL prefill cannot go through [`Speculator::prefill`]:
+    /// that path seeds the target from TOKEN IDS, and a VL prompt's image
+    /// positions are embeddings with no token spelling. The VL path therefore
+    /// runs its own prefill (embedding span + 3-axis positions) and hands the
+    /// captured rows back here.
+    ///
+    /// hipfire is better placed than the references for this. llama.cpp's
+    /// EAGLE3 skips any batch carrying embeddings outright
+    /// (`common/speculative.cpp`), so its drafter never sees image rows at
+    /// all; DFlash seeds from TARGET hidden states, and the target computes
+    /// real hidden states for image rows during its own prefill — so the rows
+    /// exist and there is no hole.
+    pub fn hidden_rb_mut(&mut self) -> &mut HiddenStateRingBuffer {
+        &mut self.df.hidden_rb
+    }
+
+    /// Prime the drafter from hidden states already captured in
+    /// [`Self::hidden_rb_mut`], instead of re-running the target.
+    ///
+    /// This is exactly the second half of [`Speculator::prefill`] — the half
+    /// that is provenance-agnostic, since it only reads the captured rows.
+    /// The first half (running the target over tokens) is what the VL caller
+    /// substitutes.
+    ///
+    /// Note on the drafter's own token embedding: at image positions the id is
+    /// `image_pad`, a real vocab id with no meaning, so acceptance degrades for
+    /// the few tokens after an image and then recovers. That matches SGLang,
+    /// whose EAGLE draft embedding "clamps unconditionally (to tolerate
+    /// multimodal pad sentinels)". Low image-adjacent tau is expected
+    /// behaviour, not a defect — none of the references do better.
+    pub fn prime_from_hidden(&mut self, gpu: &mut Gpu, prompt_len: usize) -> Result<(), String> {
+        if prompt_len == 0 {
+            return Err("prime_from_hidden: empty prompt".to_string());
+        }
+        let block = crate::speculative::download_hidden_block(gpu, &self.df.hidden_rb, prompt_len)
+            .map_err(|e| {
+                hipfire_runtime::reset_core::note_hip_error(&e, "qwen35::dflash_prime::download");
+                e.to_string()
+            })?;
+        self.df.target_hidden_host.clear();
+        self.df.target_hidden_host.extend_from_slice(&block);
+
+        crate::speculative::scatter_hidden_block_to_interleaved(
+            gpu,
+            &self.df.hidden_rb,
+            &self.df.draft_scratch.target_hidden,
+            0,
+            prompt_len,
+            prompt_len,
+            self.df.draft_scratch.ctx_modulus(),
+        )
+        .map_err(|e| {
+            hipfire_runtime::reset_core::note_hip_error(&e, "qwen35::dflash_prime::scatter");
+            e.to_string()
+        })?;
+
+        // Cold-prefill backfill: the 4+1 split's last (full) layer needs K/V
+        // for every prompt row. No-op for all-sliding DFlash2 and for
+        // prompt_len <= W, but safe on both — same call the token path makes.
+        hipfire_runtime::dflash::draft_seed_backfill(
+            gpu,
+            &self.df.draft_weights,
+            &self.df.draft_config,
+            &mut self.df.draft_scratch,
+            &self.df.target_hidden_host,
+            prompt_len,
+        )
+        .map_err(|e| {
+            hipfire_runtime::reset_core::note_hip_error(&e, "qwen35::dflash_prime::backfill");
+            e.to_string()
+        })?;
+        self.df.draft_scratch.thlog.seed_prompt(prompt_len);
+        Ok(())
+    }
+}
+
 impl Speculator for DflashSpeculator {
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
     fn name(&self) -> &'static str {
         "dflash"
     }
@@ -1348,8 +1431,7 @@ pub fn load_dflash_speculator_dense_tp2(
     let dim = target.configs[0].dim;
     let vocab = target.configs[0].vocab_size;
     let hidden_k = dim.next_power_of_two();
-    let draft_hfq =
-        HfqFile::open(Path::new(draft_path)).map_err(|e| format!("draft open: {e}"))?;
+    let draft_hfq = HfqFile::open(Path::new(draft_path)).map_err(|e| format!("draft open: {e}"))?;
     let draft_config = DflashConfig::from_hfq(&draft_hfq)
         .ok_or_else(|| "draft: failed to parse DflashConfig from HFQ metadata".to_string())?;
     if !draft_config.all_layers_sliding {
@@ -1502,7 +1584,14 @@ pub fn load_dflash_speculator_dense_tp2(
             "HiddenStateRingBuffer::new_for_layers"
         );
         let verify_scratch = or_unwind_owned!(
-            VerifyScratch::with_prefill(gpu, block_size, dim, vocab, hidden_k, &target.configs[rank]),
+            VerifyScratch::with_prefill(
+                gpu,
+                block_size,
+                dim,
+                vocab,
+                hidden_k,
+                &target.configs[rank]
+            ),
             "VerifyScratch::with_prefill"
         );
         let target_snap = or_unwind_owned!(
