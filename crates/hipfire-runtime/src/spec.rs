@@ -209,6 +209,28 @@ pub trait SpecTarget {
     /// offset — used by the daemon's mid-generation abort path in place of its
     /// current inline memset loop. Returns `Err` when any HIP memset/bind fails
     /// so production rollback can attest `rolled_back:false`.
+    /// Rope-phase bias for decode positions, applied WITHOUT touching KV slot
+    /// indices. Default no-op: every text target ignores it and stays
+    /// byte-identical.
+    ///
+    /// A VL prompt needs it. `MropeCtx::pos3` falls off the end of the prompt
+    /// into `[pos + rope_delta; 3]`, so a decode step rotates at
+    /// `pos + rope_delta`, not `pos` — `rope_delta` was -56 for a single
+    /// 64x64 image (64 visual tokens collapsing to an 8-wide grid advance).
+    /// A speculator target that rotates at plain `pos` produces wrong logits,
+    /// and DFlash's exact verify would then faithfully reproduce a wrong
+    /// answer: this is a correctness bias, not a tuning knob.
+    ///
+    /// Same shape as `KvCache::compact_offset`, which the batched rope call
+    /// already applies as a rope-only offset while `pbs.positions` stays
+    /// physical for the KV write.
+    ///
+    /// Safe to express as 1-D: decode-step mrope is UNIFORM (`[p; 3]`), and
+    /// uniform 3-axis mrope is bit-identical to 1-D rope — measured on gfx1201
+    /// at offsets 0/713/4096 by
+    /// `rdna-compute/examples/test_mrope_rope_parity_batched.rs`.
+    fn set_rope_phase_bias(&mut self, _bias: i32) {}
+
     fn reset_recurrent(&mut self, gpu: &mut Gpu) -> Result<(), String>;
 
     /// Whether this target's architecture reset-core is complete enough for

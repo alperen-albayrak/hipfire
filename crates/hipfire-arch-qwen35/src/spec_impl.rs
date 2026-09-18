@@ -91,6 +91,10 @@ impl SpecScratch for Qwen35SpecScratch {
 }
 
 impl SpecTarget for ModelSlot {
+    fn set_rope_phase_bias(&mut self, bias: i32) {
+        self.rope_phase_bias = bias;
+    }
+
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
     }
@@ -181,7 +185,7 @@ impl SpecTarget for ModelSlot {
                 return Ok(SpecAdvance::Aborted);
             }
             let end = (off + chunk_max).min(tokens.len());
-            qwen35::forward_prefill_batch(
+            qwen35::forward_prefill_batch_rope_biased(
                 gpu,
                 &self.weights,
                 &self.config,
@@ -191,9 +195,7 @@ impl SpecTarget for ModelSlot {
                 &mut self.dn_state,
                 &self.scratch,
                 None,
-                None,
-                None,
-                None,
+                self.rope_phase_bias,
             )
             .map_err(|e| e.to_string())?;
             pos += end - off;
@@ -356,7 +358,7 @@ impl SpecTarget for ModelSlot {
         s.target_snap
             .restore_to(&mut self.dn_state, gpu)
             .map_err(|e| e.to_string())?;
-        qwen35::forward_prefill_batch(
+        qwen35::forward_prefill_batch_rope_biased(
             gpu,
             &self.weights,
             &self.config,
@@ -366,9 +368,7 @@ impl SpecTarget for ModelSlot {
             &mut self.dn_state,
             &self.scratch,
             None,
-            None,
-            None,
-            None,
+            self.rope_phase_bias,
         )
         .map_err(|e| e.to_string())?;
         Ok(())
@@ -601,7 +601,7 @@ impl SpecTarget for ModelSlot {
         // 1-token capture-armed forward at `position` (hidden_rb Some arms the
         // per-extract-layer hidden capture; same proven call as
         // `seed_target_hidden_from_prompt`).
-        let host_result = qwen35::forward_prefill_batch(
+        let host_result = qwen35::forward_prefill_batch_rope_biased(
             gpu,
             &self.weights,
             &self.config,
@@ -611,9 +611,7 @@ impl SpecTarget for ModelSlot {
             &mut self.dn_state,
             &self.scratch,
             Some(&mut ring),
-            None,
-            None,
-            None,
+            self.rope_phase_bias,
         )
         .map_err(|e| format!("capture_seed_main_hidden forward: {e:?}"))
         .and_then(|()| {

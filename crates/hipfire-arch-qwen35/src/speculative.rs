@@ -777,6 +777,12 @@ pub struct ModelSlot {
     /// tower while the bundle is out of `ModelState`.
     pub vision_config: Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionConfig>,
     pub vision_weights: Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionWeights>,
+    /// Rope-phase bias for decode positions (see
+    /// `SpecTarget::set_rope_phase_bias`). 0 for every text request, which
+    /// keeps the verify forwards byte-identical; non-zero only when
+    /// speculating over a VL conversation, where `MropeCtx::rope_delta`
+    /// shifts decode positions away from the token index.
+    pub rope_phase_bias: i32,
 }
 
 impl ModelSlot {
@@ -826,6 +832,7 @@ impl ModelSlot {
             kv_cache,
             dn_state,
             scratch,
+            rope_phase_bias: 0,
             slot_config: ModelSlotConfig::default(),
             dspark_extract_layers: Vec::new(),
             vision_config,
@@ -966,6 +973,7 @@ impl ModelSlot {
             dspark_extract_layers: Vec::new(),
             vision_config: None,
             vision_weights: None,
+            rope_phase_bias: 0,
         })
     }
 

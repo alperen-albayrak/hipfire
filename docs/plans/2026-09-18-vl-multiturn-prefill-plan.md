@@ -467,6 +467,48 @@ degrades for the few tokens following an image and recovers. Do NOT expect
 image-adjacent tau to match text; none of the references achieve that, and a
 low tau there is expected behaviour, not a bug to chase.
 
+### CORRECTION (2026-09-18): this task is correctness-sensitive, not throughput-only
+
+An earlier note here claimed the worst case for Task 6 was "no speedup", on the
+grounds that DFlash verify is exact. **That was wrong.** Exactness only means
+the drafter is checked against *the target*; if the target itself rotates at
+the wrong phase, verification faithfully reproduces a wrong answer.
+
+`MropeCtx::pos3` (`qwen35/config.rs:773`) falls off the end of the prompt into:
+
+```rust
+None => [pos as i32 + self.rope_delta; 3],   // decode steps
+```
+
+So a VL decode step rotates at **`pos + rope_delta`**, not `pos`. Observed
+`rope_delta = -56` for a 64x64 image (64 visual tokens collapsing to an 8-wide
+grid advance). `SpecTarget`'s forwards are plain 1-D at `pos` — `spec.rs`
+contains zero mrope references — so routing VL decode through `spec.step` as-is
+would rotate every decode token 56 positions off. Wrong logits, wrong output.
+
+**But the fix is small**, because decode-step mrope is UNIFORM (`[p; 3]`, same
+on all three axes) and therefore numerically plain 1-D RoPE at a shifted
+position. What the spec path needs is a scalar rope-phase bias, not 3-axis
+mrope.
+
+hipfire already has that mechanism: the batched rope call takes
+`kv_cache.compact_offset` as a rope-only offset while `pbs.positions` stays
+physical for the KV write. `rope_delta` is the same shape of thing — a phase
+bias that must never reach slot indices.
+
+**Revised order for this task:**
+
+1. Thread a rope-phase bias (default 0, so text is byte-identical) through
+   `SpecTarget`'s advance/verify forwards.
+2. **GPU parity harness FIRST**: AR-decoded VL output vs spec-decoded,
+   token-for-token at temperature 0. The channel-invariance suite covers
+   formatting; this covers POSITIONS, which is the new risk and the one that
+   produces plausible-looking wrong text.
+3. Only then wire the decode loop.
+
+Do not wire the loop before (1): without the bias the change is actively
+wrong, not merely ineffective.
+
 **The remaining bulk is the decode loop, not the seeding.** `generate_vl` has a
 bespoke AR decode loop carrying think-routing (`<think>`/`</think>` pairing and
 force-close), the emit contract, abort polling, eviction and adaptive

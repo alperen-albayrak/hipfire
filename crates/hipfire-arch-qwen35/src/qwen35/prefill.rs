@@ -842,6 +842,73 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
 /// at a hard staging budget (e.g. eviction ≤ 256), and pass a hidden ring
 /// whose `max_batch` will also bound actual chunks.
 #[allow(clippy::too_many_arguments)]
+/// [`forward_prefill_batch`] with a rope-phase bias on the positions, applied
+/// WITHOUT moving KV slot indices (`start_pos` still drives the KV write).
+///
+/// `bias == 0` delegates verbatim, so every text caller stays byte-identical.
+///
+/// Exists for speculative decode over a VL conversation. `MropeCtx::pos3`
+/// falls off the end of the prompt into `[pos + rope_delta; 3]`, so a VL decode
+/// step rotates at `pos + rope_delta`; a verify forward at plain `pos` yields
+/// wrong logits, which DFlash's exact verify would then faithfully reproduce.
+///
+/// Expressed as a uniform 3-axis `MropeBatch` rather than a new kernel path:
+/// decode-step mrope IS uniform, and uniform mrope is bit-identical to 1-D rope
+/// — measured on gfx1201 at offsets 0/713/4096 by
+/// `rdna-compute/examples/test_mrope_rope_parity_batched.rs`. One triple per
+/// token in a verify block is a negligible allocation.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_prefill_batch_rope_biased(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch: &Qwen35Scratch,
+    hidden_rb: Option<&mut HiddenStateRingBuffer>,
+    bias: i32,
+) -> HipResult<()> {
+    if bias == 0 {
+        return forward_prefill_batch(
+            gpu, weights, config, tokens, start_pos, kv_cache, dn_state, scratch, hidden_rb, None,
+            None, None,
+        );
+    }
+    let positions: Vec<[i32; 3]> = (0..tokens.len())
+        .map(|i| {
+            let p = (start_pos + i) as i32 + bias;
+            [p, p, p]
+        })
+        .collect();
+    forward_prefill_batch_with_pbs_opts(
+        gpu,
+        weights,
+        config,
+        tokens,
+        start_pos,
+        kv_cache,
+        dn_state,
+        scratch,
+        hidden_rb,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+        DflashFusionCtx::Off,
+        Some(MropeBatch {
+            positions: &positions,
+            pos_offset: 0,
+            section: config.mrope_section,
+        }),
+        None,
+    )
+}
+
 pub fn forward_prefill_batch(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
