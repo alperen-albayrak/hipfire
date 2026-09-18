@@ -189,14 +189,42 @@ carry these embeddings, at these 3-axis positions".
 **Files:** `crates/hipfire-arch-qwen35/src/qwen35/prefill.rs`
 (`forward_prefill_batch`, `forward_prefill_batch_with_pbs`).
 
-**Do:** Add two parameters, in the existing `Option<…>` style:
-`embed_override: Option<&EmbedOverride>` (positions → rows of a
-`[n_override × dim]` host or device buffer) and
-`positions: Option<&[[i32; 3]]>` (per-token, `None` ⇒ today's
-`start_pos + i` 1-D behaviour). Where the batch builds its embedding rows,
-substitute override rows; where it applies RoPE, take the 3-axis positions when
-supplied. Keep every existing call site compiling by passing `None, None` —
-prove byte-identical text output before touching VL.
+**Every piece of this already exists** (verified 2026-09-18 by code read) — the
+task is wiring, not kernel work:
+
+- **The batched M-RoPE kernel is written and has ZERO callers.**
+  `Gpu::rope_mrope_halfsplit_f32_batched` (`crates/rdna-compute/src/norm.rs:1387`)
+  over `kernels/src/rope_mrope_halfsplit_batched.hip`. It already takes
+  `positions` as `[batch_size][3]` row-major, a `pos_offset: i32` base — i.e.
+  the cross-turn cursor — and `section: [usize; 3]`, and its axis rule
+  (`m==1 && i < 3*sec_h → H`, `m==2 && i < 3*sec_w → W`, else `T`) matches
+  `mrope_axis_for_freq`. Somebody built this for exactly this job and stopped.
+- **Embedding override into the batch already exists.** `MaskEmbedOverride
+  { slot, embed }` (`qwen35/config.rs:89`) is applied in
+  `batch_chunk_embed_tokens` (`prefill.rs:~4192`) by `memcpy_htod_offset` into
+  `pbs.x_batch` *after* the embedding lookup. Everything downstream — attention,
+  DeltaNet, FFN — consumes `x_batch` and is agnostic to provenance, which is
+  what makes the recurrent path a non-issue. One image is a contiguous span, so
+  generalizing `slot: usize` to a span is one wider memcpy, not N writes.
+- **The fused FA+rope prep is not on the critical path here.**
+  `fa_prep_fused_ok` requires `fusion == DflashFusionCtx::ChainVerify &&
+  gpu.arch_caps.is_gfx1100()`. On gfx1201 the else branch (separate
+  deinterleave + standalone rope) always runs, so only ONE rope site needs the
+  mrope branch. Still add a guard so mrope and `ChainVerify` fusion cannot
+  combine on gfx1100.
+- **A new position buffer is needed.** `pbs.rope_positions` is
+  `alloc!(&[max_batch], DType::F32)` (`qwen35/batch.rs:291`) — one scalar per
+  token. M-RoPE needs three `i32` per token, so add a sibling
+  `mrope_positions` sized `max_batch * 3`.
+
+**Do:** Add a `mrope_positions` buffer to `PrefillBatchScratch`; generalize
+`MaskEmbedOverride` to a contiguous span (`slot`, `rows: &[f32]` of
+`len == n * dim`); add `mrope: Option<MropeBatch<'_>>` (positions + `pos_offset`
++ `section`) to `forward_prefill_batch*`, dispatching to
+`rope_mrope_halfsplit_f32_batched` when supplied and the existing
+`rope_partial_interleaved_f32_batched` when not. Keep every existing call site
+compiling by passing `None` — prove byte-identical text output before touching
+VL.
 
 **Done when:** text prefill is byte-identical at the logits level with both new
 parameters `None`, and a GPU unit test shows a batched run with an override at
