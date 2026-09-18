@@ -3065,6 +3065,169 @@ mod tests {
             .collect()
     }
 
+    /// Re-chunk a byte stream into fixed-size windows, modelling how a
+    /// speculative decode delivers an accepted block instead of one token.
+    fn rechunk(stream: &[u8], window: usize) -> Vec<Vec<u8>> {
+        stream.chunks(window.max(1)).map(<[u8]>::to_vec).collect()
+    }
+
+    /// Re-chunk into VARIABLE windows, modelling a real acceptance trace where
+    /// the accepted length changes every cycle with tau.
+    fn rechunk_variable(stream: &[u8], pattern: &[usize]) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let (mut i, mut p) = (0usize, 0usize);
+        while i < stream.len() {
+            let take = pattern[p % pattern.len()].max(1).min(stream.len() - i);
+            out.push(stream[i..i + take].to_vec());
+            i += take;
+            p += 1;
+        }
+        out
+    }
+
+    fn drive_owned(started_in_think: bool, chunks: &[Vec<u8>]) -> Vec<(String, String)> {
+        let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+        drive(started_in_think, &refs)
+    }
+
+    /// THE contract a speculative VL decode has to satisfy.
+    ///
+    /// AR emits one token per step; a speculative decode emits a whole
+    /// accepted window at once. Both feed the same bytes to
+    /// `vl_route_decode_text`, just grouped differently -- so the split into
+    /// `reasoning` vs `content` must not depend on the grouping. If this ever
+    /// fails, routing DFlash through the VL decode loop silently mis-splits
+    /// channels: the 2026-08-27 "post-thinking garble" failure mode, which
+    /// produces malformed output rather than an error.
+    ///
+    /// Covers every window from 1 byte (finest AR) to whole-stream (coarsest
+    /// possible acceptance), plus variable-width traces.
+    #[test]
+    fn channel_split_is_invariant_to_delivery_chunking() {
+        let cases: &[(bool, &[u8])] = &[
+            // Think-prefixed turn: opener implicit, closer in-stream.
+            (
+                true,
+                b"Let me look at the picture.\n\n</think>\n\nA red square on white.<|im_end|>",
+            ),
+            // Spontaneous markers mid-stream from a plain prefix.
+            (
+                false,
+                b"Sure.<think>internal deliberation</think>Final answer here.<|im_end|>",
+            ),
+            // No think at all.
+            (
+                false,
+                b"Just a plain description with no markers.<|im_end|>",
+            ),
+            // Multibyte UTF-8 either side of the closer, which a naive
+            // re-chunker would split mid-codepoint.
+            (
+                true,
+                "düşünüyorum — ünlü\n</think>\nYanıt: kırmızı kare ✅<|im_end|>".as_bytes(),
+            ),
+            // Empty reasoning body: closer arrives immediately.
+            (true, b"</think>content only<|im_end|>"),
+        ];
+
+        for (started_in_think, stream) in cases {
+            let baseline = drive_owned(*started_in_think, &rechunk(stream, stream.len()));
+            let want_reasoning = joined(&baseline, "reasoning");
+            let want_content = joined(&baseline, "token");
+            // Guard against a vacuous pass: if the channel names ever drift,
+            // both sides would compare empty-to-empty and this sweep would
+            // assert nothing.
+            assert!(
+                !want_content.is_empty(),
+                "content channel empty for {:?} -- channel name drift?",
+                String::from_utf8_lossy(stream),
+            );
+
+            for window in 1..=stream.len() {
+                let got = drive_owned(*started_in_think, &rechunk(stream, window));
+                assert_eq!(
+                    joined(&got, "reasoning"),
+                    want_reasoning,
+                    "reasoning channel changed at window={window} for {:?}",
+                    String::from_utf8_lossy(stream),
+                );
+                assert_eq!(
+                    joined(&got, "token"),
+                    want_content,
+                    "content channel changed at window={window} for {:?}",
+                    String::from_utf8_lossy(stream),
+                );
+            }
+
+            // Variable acceptance widths, as a real tau trace produces.
+            for pattern in [&[1usize, 4, 2, 7][..], &[3, 1, 1, 5, 2][..], &[8, 1][..]] {
+                let got = drive_owned(*started_in_think, &rechunk_variable(stream, pattern));
+                assert_eq!(
+                    joined(&got, "reasoning"),
+                    want_reasoning,
+                    "reasoning channel changed for acceptance pattern {pattern:?}",
+                );
+                assert_eq!(
+                    joined(&got, "token"),
+                    want_content,
+                    "content channel changed for acceptance pattern {pattern:?}",
+                );
+            }
+        }
+    }
+
+    /// The specific hazard: an acceptance window ending INSIDE `</think>`.
+    /// Enumerated explicitly rather than trusting the sweep to hit it, because
+    /// this is the boundary that actually broke VL before.
+    #[test]
+    fn window_boundary_inside_the_closer_still_splits() {
+        const CLOSER: &str = "</think>";
+        let head = b"reasoning body";
+        let tail = b"visible body<|im_end|>";
+        for cut in 1..CLOSER.len() {
+            let mut a = head.to_vec();
+            a.extend_from_slice(&CLOSER.as_bytes()[..cut]);
+            let mut b = CLOSER.as_bytes()[cut..].to_vec();
+            b.extend_from_slice(tail);
+
+            let got = drive_owned(true, &[a, b]);
+            assert_eq!(
+                joined(&got, "reasoning"),
+                "reasoning body",
+                "closer split after {cut} byte(s) leaked into reasoning",
+            );
+            assert_eq!(
+                joined(&got, "token"),
+                "visible body",
+                "closer split after {cut} byte(s) corrupted content",
+            );
+        }
+    }
+
+    /// A stop marker split across an acceptance window must still suppress the
+    /// marker and keep the preceding text in the right channel -- the window
+    /// equivalent of `stop_marker_returns_true_and_emits_preceding_text_without_leakage`.
+    #[test]
+    fn stop_marker_split_across_windows_is_suppressed() {
+        const EOT: &str = "<|im_end|>";
+        for cut in 1..EOT.len() {
+            let mut a = b"done.".to_vec();
+            a.extend_from_slice(&EOT.as_bytes()[..cut]);
+            let b = EOT.as_bytes()[cut..].to_vec();
+
+            let got = drive_owned(false, &[a, b]);
+            let content = joined(&got, "token");
+            assert_eq!(
+                content, "done.",
+                "EOT split after {cut} byte(s) leaked into content",
+            );
+            assert!(
+                !content.contains("im_end"),
+                "stop marker text must never reach the wire",
+            );
+        }
+    }
+
     #[test]
     fn thinking_turn_splits_reasoning_from_content() {
         // OpenThink prefix: generation starts inside think (no opener in the
