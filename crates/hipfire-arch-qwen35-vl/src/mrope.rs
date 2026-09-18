@@ -163,6 +163,75 @@ pub fn cursor_at_token(upto: usize, spans: &[ImageSpan], spatial_merge_size: usi
     cursor
 }
 
+/// One image span in a framed conversation, tagged with the identity of the
+/// image that produced it.
+///
+/// `content_id` must cover everything that changes the resulting visual
+/// tokens, not just the image bytes: preprocessing config, resolved grid dims,
+/// `spatial_merge_size`, and the vision sidecar's identity. Hashing bytes
+/// alone can false-hit across a config change and splice embeddings that do
+/// not match the retained KV. vLLM's `MultiModalHasher` folds `model_id` and
+/// `hash_factors` in for exactly this reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaggedSpan {
+    pub span: ImageSpan,
+    pub content_id: u64,
+}
+
+/// Longest common prefix of two framed conversations, in TOKENS, safe to reuse
+/// as KV.
+///
+/// A plain token walk is not merely insufficient here, it is wrong: image
+/// positions are `image_pad` repeated, so two DIFFERENT images of the same
+/// grid size produce byte-identical token runs and a token walk matches them.
+/// This walks tokens but, at a span start, requires the `content_id` and token
+/// length to agree before accepting the span — llama.cpp's `get_common_prefix`
+/// media arm.
+///
+/// The result never splits a span: a mismatched image truncates the prefix at
+/// its START, so the returned length is always a boundary at which
+/// [`cursor_at_token`] is defined.
+pub fn vl_common_prefix(
+    a_tokens: &[u32],
+    a_spans: &[TaggedSpan],
+    b_tokens: &[u32],
+    b_spans: &[TaggedSpan],
+) -> usize {
+    let max_idx = a_tokens.len().min(b_tokens.len());
+    let span_at = |spans: &[TaggedSpan], i: usize| -> Option<TaggedSpan> {
+        spans.iter().find(|t| t.span.start == i).copied()
+    };
+
+    let mut i = 0usize;
+    while i < max_idx {
+        match (span_at(a_spans, i), span_at(b_spans, i)) {
+            (Some(x), Some(y)) => {
+                // Same image, same extent -> the whole span is reusable.
+                if x.content_id == y.content_id && x.span.len == y.span.len {
+                    // A span running past the shorter prompt cannot be
+                    // accepted: its KV is not fully present on both sides.
+                    if i + x.span.len > max_idx {
+                        return i;
+                    }
+                    i += x.span.len;
+                    continue;
+                }
+                // Different image: truncate at the span start, never inside.
+                return i;
+            }
+            // A span on one side and plain text on the other: divergence.
+            (Some(_), None) | (None, Some(_)) => return i,
+            (None, None) => {
+                if a_tokens[i] != b_tokens[i] {
+                    return i;
+                }
+                i += 1;
+            }
+        }
+    }
+    max_idx
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,6 +419,92 @@ mod tests {
             whole.positions[resume_at..],
             "a prefill resumed at the cursor must match one-shot framing",
         );
+    }
+
+    fn tagged(start: usize, gh: usize, gw: usize, merge: usize, id: u64) -> TaggedSpan {
+        TaggedSpan {
+            span: span(start, gh, gw, merge),
+            content_id: id,
+        }
+    }
+
+    /// Two DIFFERENT images produce byte-identical token runs (image_pad
+    /// repeated), so a token-only walk matches them and would reuse KV that
+    /// belongs to another picture. This is the correctness case, not an
+    /// optimisation: the prefix must truncate at the span START.
+    #[test]
+    fn different_image_same_shape_does_not_match() {
+        let merge = 2;
+        let pad = 9999u32;
+        let a_img = tagged(3, 16, 16, merge, 0xAAAA);
+        let b_img = tagged(3, 16, 16, merge, 0xBBBB); // same shape, other image
+        let mut toks: Vec<u32> = vec![1, 2, 3];
+        toks.extend(std::iter::repeat(pad).take(a_img.span.len));
+        toks.extend([7, 8]);
+
+        // Token runs are identical on both sides -- that is the trap.
+        assert_eq!(a_img.span.len, b_img.span.len);
+        let cut = vl_common_prefix(&toks, &[a_img], &toks, &[b_img]);
+        assert_eq!(
+            cut, 3,
+            "must truncate at the image start, not inside or past it"
+        );
+    }
+
+    /// The same image in the same place is reusable, and the walk continues
+    /// past it into the following text.
+    #[test]
+    fn same_image_matches_and_walk_continues() {
+        let merge = 2;
+        let pad = 9999u32;
+        let img = tagged(3, 16, 16, merge, 0xAAAA);
+        let mut a: Vec<u32> = vec![1, 2, 3];
+        a.extend(std::iter::repeat(pad).take(img.span.len));
+        a.extend([7, 8, 9]);
+        let mut b = a.clone();
+        // Diverge only AFTER the image.
+        let last = b.len() - 1;
+        b[last] = 42;
+
+        let cut = vl_common_prefix(&a, &[img], &b, &[img]);
+        assert_eq!(
+            cut,
+            a.len() - 1,
+            "identical image must be traversed, divergence found in trailing text",
+        );
+        // The cut is a boundary where the cursor is defined.
+        let _ = cursor_at_token(cut, &[img.span], merge);
+    }
+
+    /// An image against plain text at the same index is divergence, not a
+    /// token comparison -- `image_pad` could otherwise coincide with a real id.
+    #[test]
+    fn image_versus_text_diverges_at_the_span() {
+        let merge = 2;
+        let pad = 9999u32;
+        let img = tagged(2, 8, 8, merge, 0xAAAA);
+        let mut a: Vec<u32> = vec![1, 2];
+        a.extend(std::iter::repeat(pad).take(img.span.len));
+        let b: Vec<u32> = std::iter::repeat(pad).take(a.len()).collect();
+        let b = [vec![1u32, 2], b[2..].to_vec()].concat();
+
+        let cut = vl_common_prefix(&a, &[img], &b, &[]);
+        assert_eq!(cut, 2, "text side must not absorb an image span");
+    }
+
+    /// A span that runs past the shorter conversation is not reusable: its KV
+    /// is not fully present on both sides.
+    #[test]
+    fn span_overrunning_the_shorter_side_is_rejected() {
+        let merge = 2;
+        let pad = 9999u32;
+        let img = tagged(2, 16, 16, merge, 0xAAAA);
+        let mut a: Vec<u32> = vec![1, 2];
+        a.extend(std::iter::repeat(pad).take(img.span.len));
+        let b: Vec<u32> = a[..a.len() - 4].to_vec(); // truncated mid-image
+
+        let cut = vl_common_prefix(&a, &[img], &b, &[img]);
+        assert_eq!(cut, 2, "must not accept a partially present span");
     }
 
     /// The frequency-to-axis map is interleaved `[THWTHW...TT]`, not chunked.

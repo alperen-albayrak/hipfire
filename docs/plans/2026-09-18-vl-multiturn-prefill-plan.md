@@ -167,17 +167,26 @@ produces plausible-looking wrong output rather than an error.
 `crates/hipfire-generate/src/vision.rs` (`build_vl_mrope_ctx`),
 `crates/hipfire-generate/src/common.rs` (reset paths).
 
-**Do:** Add `mrope_cursor: usize` to `LoadedModel` beside `seq_pos`, cleared
-wherever `seq_pos` and `conversation_tokens` are cleared (`common::` reset
-helpers, `vl_rollback_uncommitted`, `vl_cancel_after_rollback`, the daemon reset
-arm). Pass it as `base` to `build_vl_mrope_ctx`; delete the `base > 0` bail.
-After a successful prefill, advance
-`mrope_cursor = base + built.rope_delta + prompt_tokens.len()` (i.e.
-`max_pos + 1`). Text-only turns on a VL-capable model advance it by their token
-count.
+**SUPERSEDED — done differently, and better (landed 2026-09-18).** The plan
+called for storing `mrope_cursor` on `LoadedModel`. Rejected on contact with
+the code: there are **17** `seq_pos = 0` sites and **76**
+`conversation_tokens.clear()` sites, and one missed reset mis-positions every
+token after an image with no error. A stored cursor is a stale-state bug
+waiting for a careless edit.
 
-**Done when:** Task 0's cross-turn fixtures pass. Behaviour is unchanged at this
-point, because the daemon still force-resets — Task 1 is inert until Task 5.
+**Derived instead**, as llama.cpp's `pos_from_tokens()` does: the whole
+conversation is reframed on every VL request, so
+`mrope::cursor_at_token(upto, spans, merge)` is a pure function of the request
+with no cross-request state and nothing to reset. Proven against
+`build_mrope_positions` at end-of-prompt and at every span boundary across
+two-image layouts (`cursor_agrees_with_builder_at_every_boundary`), plus an
+exact-resumption test.
+
+**The `base > 0` guard STAYS**, contrary to the original plan. The live caller
+passes `m.seq_pos` — a token count — which is sound only because the daemon
+force-resets it. Removing the guard before a caller passes a real cursor turns
+a loud refusal into silent mis-positioning. It is removed in Task 5, with the
+caller, not before.
 
 ---
 
@@ -260,8 +269,31 @@ output is unchanged token-for-token versus the per-token path at temperature 0.
 
 **Goal:** An unchanged image earlier in a conversation is a cache hit.
 
-**Files:** `crates/hipfire-daemon/src/main.rs` (conversation tracking),
-`crates/hipfire-runtime/src/prompt_frame.rs` (span metadata).
+**Files:** `crates/hipfire-generate/src/ar.rs` (the live LCP),
+`crates/hipfire-generate/src/vision.rs`, `crates/hipfire-loader/src/lib.rs`
+(`LoadedModel` conversation state).
+
+**Corrections from the code read (2026-09-18):**
+
+- **The prefix match is NOT in the daemon.** It lives in `ar.rs:~3174` — a
+  plain token walk, `while lcp < max_match && m.conversation_tokens[lcp] ==
+  rendered[lcp]` — on the text/AR path. `generate_vl` has no LCP at all; it
+  force-resets instead. So this task adds prefix reuse to VL, it does not
+  merely extend a shared one.
+- **A token-only LCP is not merely insufficient, it is WRONG for images.**
+  Image positions in `conversation_tokens` are `image_pad_id` repeated
+  `n_visual` times, so two *different* images of the same grid size produce
+  byte-identical token runs and a token walk matches them happily. Content-id
+  comparison is a correctness requirement, not an optimisation.
+- **Staleness must fail safe, not fail silent.** Storing spans alongside
+  `conversation_tokens` reintroduces the problem Task 1 avoided: 76 clear
+  sites, one missed = stale spans. Do NOT rely on remembering to clear them.
+  Record the token length the spans describe and require it to equal
+  `conversation_tokens.len()` at lookup; a mismatch means "no reuse" and falls
+  back to today's full re-prefill. A missed clear then costs performance, never
+  correctness. (llama.cpp avoids this structurally, by making `server_tokens`
+  own the token vector and the media map together — the cleaner fix, at the
+  cost of touching every `conversation_tokens` user.)
 
 **Do:** Record image spans alongside `conversation_tokens` as
 `(start, len, content_id)`. Extend the LCP walk: at a span start, match only if
