@@ -1,0 +1,358 @@
+# VL Multi-Turn Prefill & Position Continuity — Implementation Plan
+
+**Goal:** Make an image turn cost what a text turn costs. Today a VL request
+prefills per-token at ~33 tok/s, discards the conversation KV on every turn, and
+decodes without DFlash. Fix the three together: batch the VL prefill, carry the
+M-RoPE position cursor across turns, and let the existing prefix cache apply to
+conversations that contain images.
+
+**Architecture:** Promote the M-RoPE position cursor to *primary* conversation
+state (`mrope_cursor`, beside `seq_pos`) instead of deriving it per request;
+extend `forward_prefill_batch` with an embedding override and an explicit
+per-token position array; teach the `conversation_tokens` LCP match to compare
+image spans by content id. This is the llama.cpp `mtmd` / `server_tokens`
+design, which solves the same problem — see § Prior art.
+
+**Tech Stack:** Rust (`hipfire-generate`, `hipfire-arch-qwen35`,
+`hipfire-arch-qwen35-vl`, `hipfire-daemon`). No new HIP kernels: the batched
+prefill kernel already exists and is used by the text path.
+
+**Predecessor:** `docs/plans/completions_vision.md` (Phase 1 — image input over
+`/v1/chat/completions`). Its "single-turn only" limitation was never enforced by
+the promised HTTP 400 guard; multi-turn framing landed instead in
+`fix(vision): frame the whole conversation on VL image turns`, which is what
+makes prefill cost the dominant issue this plan addresses.
+
+---
+
+## Measured baseline
+
+gfx1201 (Radeon AI PRO R9700, 32 GB), `qwen3.8:27b` MQ4V2 + `fwht3` KV,
+DFlash draft `qwen38-27b-dflash-mq4`, 2026-09-18, on the multi-turn framing fix.
+
+| workload | prompt | TTFT | prefill | decode |
+|---|---|---|---|---|
+| text, ~200-tok history | 373 | 0.57 s | 655 tok/s | 139.6 tok/s (dflash on) |
+| image, ~200-tok history | 406 | 12.3 s | 33.0 tok/s | 32.1 tok/s (dflash off) |
+| text, ~1400-tok history | 2654 | 4.2 s | 628 tok/s | — |
+| image, ~1400-tok history | 2687 | **82.0 s** | 32.8 tok/s | — |
+
+Prefix reuse, identical request issued twice:
+
+| | prompt | cached | TTFT |
+|---|---|---|---|
+| text, cold | 2954 | 0 | 4.73 s |
+| text, repeat | 2954 | **2304** | **1.15 s** |
+| text, conversation extended by one turn | 2991 | **2304** | 1.19 s |
+| image, cold | 1487 | 0 | 45.3 s |
+| image, repeat (byte-identical) | 1487 | **0** | 45.3 s |
+
+Targets: image prefill ≥ 500 tok/s; image repeat/extension reuses its prefix
+(cached > 0); image decode ≥ 100 tok/s once Task 6 lands.
+
+---
+
+## Grounding facts (verified by code read — reference while implementing)
+
+**Per-token VL prefill.** `crates/hipfire-generate/src/vision.rs` (~line 1311):
+"VL prefill is per-token (`forward_scratch_embed` isn't batched), so we advance
+`m.seq_pos` in-loop". The loop calls `qwen35::forward_scratch_embed_mrope` for
+image-pad positions and the token variant otherwise. This is the entire 19×
+prefill gap — the text path calls `qwen35::forward_prefill_batch`.
+
+**`forward_prefill_batch` signature** (`crates/hipfire-arch-qwen35/src/qwen35/prefill.rs:845`):
+`(gpu, weights, config, tokens, start_pos, kv_cache, dn_state, scratch,
+hidden_rb, per_token_hidden_out, gdn_tape, tree_verify)`. It has **no**
+embedding-override and **no** position-array parameter — those are the two
+additions in Task 2. Note it already carries `hidden_rb`, which Task 6 needs.
+
+**The cursor is computed and then discarded.**
+`crates/hipfire-arch-qwen35-vl/src/mrope.rs:57` `build_mrope_positions` advances
+`cursor += 1` per text token but
+`cursor += max(grid_h, grid_w) / spatial_merge_size` per image span, then
+returns `rope_delta = max_pos + 1 - n_tokens`, documented as "Added to the
+running sequence length to get decode-step positions". Nothing persists it
+across requests.
+
+**The bail.** `vision.rs` `build_vl_mrope_ctx` refuses `base > 0` with
+"cross-turn mrope cursor continuity not modelled", and its comment states the
+correct semantics: "HF would resume a later turn at `previous_max + 1` (i.e.
+`base` + the earlier turn's rope_delta)". Everything after the bail already
+accepts an arbitrary span offset — the splice validator finds the pad run by
+search and only requires it to be one contiguous run, which the multi-turn
+framing fix already exercises (observed `span start=713`, `base=0`).
+
+**The force-reset.** `crates/hipfire-daemon/src/main.rs`, VL dispatch arm: when
+`seq_pos > 0` it logs "non-zero seq_pos (N) at VL dispatch — resetting
+conversation" and clears `seq_pos`, `conversation_tokens`, both checkpoint rings
+and recurrent state. Its rationale is that the live KV was written with 1-D
+positions and splicing visual tokens into it "would produce garbage". That
+rationale dissolves once the whole conversation is positioned under one mrope
+cursor (Task 1) — a text run under mrope is `[cursor; 3]` on all three axes,
+which is numerically identical to 1-D RoPE.
+
+**The prefix cache exists and works — for text.** The daemon keeps
+`m.conversation_tokens` and matches on longest common prefix
+(`prompt_frame::continuation_suffix` documents appending as "the precondition
+for prefix reuse"). Measured above: 2304 tokens reused. VL never benefits
+because the force-reset clears `conversation_tokens` first.
+
+**The speculator is already built for VL models.**
+`crates/hipfire-loader/src/lib.rs` (~2201) selects `DflashSpeculator` whenever a
+DFlash draft is loaded, arch-generically, and parks it on
+`LoadedModel.speculator`. `generate_vl` only ever *resets* it. The obstacle is
+seeding: `seed_target_hidden_from_prompt`
+(`crates/hipfire-arch-qwen35/src/speculative.rs:8365`) re-prefills from **token
+ids** via `forward_prefill_batch`, which cannot reproduce a VL prompt because
+image positions are embeddings with no token spelling.
+
+### Prior art — llama.cpp `mtmd`
+
+Verified against `ggml-org/llama.cpp` @ 2026-09-18. It solves this by keeping
+token index and position as two coordinate systems and converting explicitly:
+
+- `tools/server/server-common.cpp` `pos_from_tokens()` walks the prompt: text →
+  `pos++, idx++`; media → `pos += n_pos, idx += n_tok`. `size_up_to_pos()` is
+  the inverse.
+- `tools/mtmd/mtmd.cpp` `mtmd_image_tokens_get_n_pos()` returns
+  `max(nx, ny)` for M-RoPE — **the same advance hipfire computes.**
+- `tools/mtmd/mtmd-helper.cpp` carries it: `n_past += mtmd_input_chunk_get_n_pos(chunk)`,
+  across chunks and across turns. No per-turn reset, and no equivalent of our
+  `base > 0` bail — `n_past` is correct by construction.
+- Prefix matching (`server_tokens::get_common_prefix`) stores media as
+  `LLAMA_TOKEN_NULL` placeholders plus a `map_idx_to_media` side table, and at a
+  media slot compares chunk **id** and token count:
+  `if (id_ai == id_bi && n_tok_a == n_tok_b) { i += n_tok_a - 1; continue; }`.
+- Batching and M-RoPE are one mechanism: `decode_embd_batch` with
+  `n_pos_per_embd = mtmd_decode_use_mrope(ctx) ? 4 : 1` and
+  `set_position_mrope_2d()` submits a whole image as one batch with an explicit
+  per-token position array. There is no per-token image path.
+
+Takeaway: `rope_delta` bookkeeping is a workaround for treating position as a
+quantity derived from a token count. Tracking position directly removes it.
+
+---
+
+## Task 0: M-RoPE cross-turn parity oracle (BLOCKING, CPU-only)
+
+**Goal:** A reference oracle for multi-turn, multi-image position sequences
+*before* any behaviour changes. Tasks 1 and 5 can silently mis-position every
+token after an image — degraded output, no error, no crash. Nothing in Tasks 1/5
+merges without this.
+
+**Files:** `crates/hipfire-arch-qwen35-vl/src/mrope.rs` (tests),
+`benchmarks/vision/` (fixture).
+
+**Do:** Dump the HF reference implementation's `get_rope_index()` (the
+Qwen-VL conditional-generation class matching this artifact) for a fixed
+set of conversations — text-only; one image at turn 0; image at turn 2; two
+images in different turns; image last — as JSON fixtures of
+`(positions[3][n], rope_delta)`. Add a pure-CPU test that walks the same
+conversations through `build_mrope_positions` with an accumulating base and
+asserts exact equality per axis.
+
+**Done when:** the fixtures exist, and the current code passes the single-turn
+cases and *fails* the cross-turn ones (proving the oracle has teeth).
+
+**Risk if skipped:** high — this is the only defect class in the plan that
+produces plausible-looking wrong output rather than an error.
+
+---
+
+## Task 1: `mrope_cursor` as conversation state (CPU, unit-tested)
+
+**Goal:** Position becomes primary state, not a per-request derivation.
+
+**Files:** `crates/hipfire-loader/src/lib.rs` (`LoadedModel`),
+`crates/hipfire-generate/src/vision.rs` (`build_vl_mrope_ctx`),
+`crates/hipfire-generate/src/common.rs` (reset paths).
+
+**Do:** Add `mrope_cursor: usize` to `LoadedModel` beside `seq_pos`, cleared
+wherever `seq_pos` and `conversation_tokens` are cleared (`common::` reset
+helpers, `vl_rollback_uncommitted`, `vl_cancel_after_rollback`, the daemon reset
+arm). Pass it as `base` to `build_vl_mrope_ctx`; delete the `base > 0` bail.
+After a successful prefill, advance
+`mrope_cursor = base + built.rope_delta + prompt_tokens.len()` (i.e.
+`max_pos + 1`). Text-only turns on a VL-capable model advance it by their token
+count.
+
+**Done when:** Task 0's cross-turn fixtures pass. Behaviour is unchanged at this
+point, because the daemon still force-resets — Task 1 is inert until Task 5.
+
+---
+
+## Task 2: embedding override + position array on `forward_prefill_batch`
+
+**Goal:** One batched prefill entry point that can express "these positions
+carry these embeddings, at these 3-axis positions".
+
+**Files:** `crates/hipfire-arch-qwen35/src/qwen35/prefill.rs`
+(`forward_prefill_batch`, `forward_prefill_batch_with_pbs`).
+
+**Do:** Add two parameters, in the existing `Option<…>` style:
+`embed_override: Option<&EmbedOverride>` (positions → rows of a
+`[n_override × dim]` host or device buffer) and
+`positions: Option<&[[i32; 3]]>` (per-token, `None` ⇒ today's
+`start_pos + i` 1-D behaviour). Where the batch builds its embedding rows,
+substitute override rows; where it applies RoPE, take the 3-axis positions when
+supplied. Keep every existing call site compiling by passing `None, None` —
+prove byte-identical text output before touching VL.
+
+**Done when:** text prefill is byte-identical at the logits level with both new
+parameters `None`, and a GPU unit test shows a batched run with an override at
+position *k* matches a per-token `forward_scratch_embed_mrope` run for the same
+input.
+
+**Risk:** touches the hot text path. Mitigate by landing this task on its own
+and running the existing Redline/golden fixtures before Task 3.
+
+---
+
+## Task 3: batched VL prefill in `generate_vl`
+
+**Goal:** Delete the per-token prefill loop. This is the 19×.
+
+**Files:** `crates/hipfire-generate/src/vision.rs`.
+
+**Do:** Replace the `for &token in prompt_tokens.iter()` loop with a single
+`forward_prefill_batch` call carrying the visual rows as `embed_override` at the
+image-pad span and the mrope positions as `positions`. Keep the abort poll at
+chunk granularity (`serve.multi_slot_prefill_chunk`-sized sub-batches) so
+mid-prefill cancellation still lands on the canonical cancelled pair — the
+current per-token loop polls `check_abort` every token, and chunking is the
+replacement, not removal. Keep `maybe_evict` / `maybe_downshift` on chunk
+boundaries.
+
+**Done when:** image prefill ≥ 500 tok/s on the baseline fixture; image-turn
+output is unchanged token-for-token versus the per-token path at temperature 0.
+
+---
+
+## Task 4: image-aware prefix match (CPU, unit-tested)
+
+**Goal:** An unchanged image earlier in a conversation is a cache hit.
+
+**Files:** `crates/hipfire-daemon/src/main.rs` (conversation tracking),
+`crates/hipfire-runtime/src/prompt_frame.rs` (span metadata).
+
+**Do:** Record image spans alongside `conversation_tokens` as
+`(start, len, content_id)`. Extend the LCP walk: at a span start, match only if
+`content_id` and `len` both agree, then skip the whole span — llama.cpp's
+`get_common_prefix` arm, transliterated. A mismatch truncates the prefix there,
+as today.
+
+**`content_id` must not be a hash of the image bytes alone.** vLLM's
+`MultiModalHasher` folds `model_id` plus `hash_factors` into the key, with the
+explicit note that "model output depends on the current modality's hash
+factors". The same bytes preprocessed under a different config yield different
+visual tokens, so a bytes-only key can false-hit and splice embeddings that do
+not match the retained KV — silent wrongness of the same family as a bad mrope
+cursor. Hash: source bytes (pre-decode, as vLLM does — cheaper and immune to
+decoder-version drift) **plus** the resolved grid dims, `spatial_merge_size`,
+the vision sidecar's identity/sha, and `image.decode` mode. Any future
+preprocessing knob must be added to this key; note that obligation next to the
+config it touches.
+
+**Done when:** unit tests cover identical image, changed image, image moved to a
+different turn, and text-only, with no GPU.
+
+---
+
+## Task 5: drop the force-reset; prefill the suffix only
+
+**Goal:** The payoff — image turns stop re-prefilling the conversation.
+
+**Files:** `crates/hipfire-daemon/src/main.rs` (VL dispatch arm).
+
+**Do:** Replace the unconditional `seq_pos > 0` reset with the text path's
+logic: compute the common prefix (Task 4), keep that KV, prefill only the
+suffix, and start it at `base = mrope_cursor` restored for the retained prefix.
+Retain the reset as the *fallback* for a prefix miss, and keep it unconditional
+under a kill switch (`HIPFIRE_VL_PREFIX_REUSE=0`) for one release.
+
+**Done when:** an image request repeated byte-identically reports `cached > 0`
+and TTFT drops to roughly decode-start latency; extending a conversation by one
+turn prefills only the new tokens; Task 0 fixtures still pass.
+
+**Risk:** highest in the plan. The reset is load-bearing today. The kill switch
+and Task 0's oracle are the mitigations; do not land this in the same PR as
+Task 3.
+
+---
+
+## Task 6: DFlash on the VL path
+
+**Goal:** Image-turn decode from ~32 to ~140 tok/s.
+
+**Files:** `crates/hipfire-generate/src/vision.rs`,
+`crates/hipfire-arch-qwen35/src/dflash_spec.rs`.
+
+**Do:** `seed_target_hidden_from_prompt` cannot be reused — it re-prefills from
+token ids. Add a seeding entry point that takes hidden states *already captured*
+during the VL prefill: pass `Some(hidden_rb)` to the Task 2 batched call (the
+parameter already exists), then seed the speculator from those rows instead of
+re-running the target. Then route `generate_vl`'s decode through
+`spec.step` like the text path, keeping the AR loop as fallback when
+`m.speculator` is `None`.
+
+**Done when:** image turns report `dflash: true` in `timings` with decode ≥ 100
+tok/s, and greedy output is byte-identical to the AR path (DFlash verification
+is exact — only τ changes).
+
+**Note:** deliberately last. It depends on Task 2's `hidden_rb` plumbing and is
+worth far less than Tasks 3/5 for an agent workload.
+
+---
+
+## Sequencing and PR boundaries
+
+```
+Task 0 (oracle, blocking)
+   ├── Task 1 (cursor)        ─┐
+   └── Task 2 (batch params)   │
+          └── Task 3 (batched VL prefill)   ← PR 1: the 19×, no behaviour risk
+                 └── Task 4 (prefix match)
+                        └── Task 5 (drop reset)  ← PR 2: the re-prefill win
+                               └── Task 6 (DFlash)  ← PR 3
+```
+
+Task 3 ships alone first: it is mechanical, verifiable against a measured
+baseline, and cannot produce silently wrong output. Tasks 1+4+5 ship together
+behind the kill switch, since a cursor without reuse is inert and reuse without
+a cursor is wrong.
+
+## Validation
+
+Per PR, on gfx1201: the baseline table above re-measured; `cargo test -p` for
+each touched crate; `scripts/leanup-ratchets.sh`; `scripts/fmt-changed.sh`.
+Task 0 fixtures run in CI (CPU-only, no GPU needed). Correctness gate for Tasks
+3 and 5 is token-identical greedy output against the pre-change binary on a
+fixed conversation set, not eyeballed answers.
+
+## What reuse does and does not buy (measured, gfx1201 / 32 GB)
+
+Capacity is not the constraint. Model + sidecar + scratch resident is 21.42 GiB
+of 31.86 GiB; KV costs **21.7 KiB/token** under `fwht3`, so the full 262 144-token
+`max_seq` is ≈5.4 GiB and the whole context fits at ≈26.8 GiB with room to spare.
+
+Reuse after Task 5 holds only under four conditions, all of which belong in the
+operator docs alongside the feature:
+
+1. **One conversation at a time.** hipfire keeps a single resident sequence.
+   Two interleaved sessions each miss the other's prefix and force a full
+   re-prefill. Cross-request prefix sharing is a paged-KV design (SGLang's
+   radix tree, vLLM's block cache); it is not reachable from a single
+   contiguous KV without a KV-layer rewrite, and is explicitly out of scope.
+2. **`serve.idle_timeout` must be `0`.** The default 300 s unloads the model and
+   takes the KV with it, so the next turn pays reload *and* re-prefill.
+3. **Append-only history.** Editing or compacting earlier turns invalidates the
+   prefix from the edit point — worth stating loudly, because context
+   compaction is exactly what a long-running agent does.
+4. **Eviction off**, or retained KV can be dropped out from under the match.
+
+## Out of scope
+
+Multi-image per request (the gateway still rejects it), audio chunks, the
+experimental multi-slot engine (it refuses images and drafters outright), and
+PFlash prompt compression (`speculation.prefill.*`, legacy, off, 32 k threshold
+— it reduces token count rather than raising throughput).
