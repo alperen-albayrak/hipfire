@@ -79,6 +79,12 @@ pub struct PrefillBatchScratch {
     // tree-verify mode; FA RoPE reads it instead of `positions` while KV
     // writes and attention seq_len keep the flat physical slots.
     pub rope_positions: GpuTensor,
+    // Per-token M-RoPE positions, `[max_batch][3]` row-major (t, h, w) as i32
+    // stored in an F32 tensor -- same dtype-cosmetic pattern as `positions`,
+    // and the layout `rope_mrope_halfsplit_batched_f32` reads
+    // (`positions[b * 3 + axis]`). Uploaded only for a VL prefill; the text
+    // path leaves it untouched and keeps the scalar `positions` path.
+    pub mrope_positions: GpuTensor,
     // Token-ids buffer feeding the batched embedding kernel. [max_batch] i32
     // stored as F32 (same dtype-cosmetic pattern as `positions`). Uploaded
     // once per batched forward and read by `embedding_lookup_hfq4g256_batched`.
@@ -289,6 +295,8 @@ impl PrefillBatchScratch {
         // when `tree_verify.is_some()`. Same i32-in-F32 cosmetic dtype
         // pattern as `positions`.
         let i_rope_positions = alloc!(&[max_batch], DType::F32);
+        // Three axes per token (t, h, w); see `mrope_positions`.
+        let i_mrope_positions = alloc!(&[max_batch * 3], DType::F32);
         let i_tokens = alloc!(&[max_batch], DType::F32);
         let i_fa_q_full_batch = alloc!(&[max_batch * q_dim * 2], DType::F32);
         let i_fa_q_batch = alloc!(&[max_batch * q_dim], DType::F32);
@@ -449,6 +457,7 @@ impl PrefillBatchScratch {
             dn_normed_rot_batch: take!(i_dn_normed_rot_batch),
             positions: take!(i_positions),
             rope_positions: take!(i_rope_positions),
+            mrope_positions: take!(i_mrope_positions),
             tokens: take!(i_tokens),
             fa_q_full_batch: take!(i_fa_q_full_batch),
             fa_q_batch: take!(i_fa_q_batch),
@@ -517,6 +526,7 @@ impl PrefillBatchScratch {
             self.dn_normed_rot_batch,
             self.positions,
             self.rope_positions,
+            self.mrope_positions,
             self.tokens,
             self.fa_q_full_batch,
             self.fa_q_batch,
