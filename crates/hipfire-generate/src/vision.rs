@@ -162,6 +162,60 @@ fn vl_finish_think_routing(
     }
 }
 
+/// The `done` terminal for a VL turn.
+///
+/// Extracted so the AR and speculative routes emit byte-identical terminals.
+/// Duplicating it would let the two drift in exactly the way
+/// `vl_commit_decoded_token` exists to prevent.
+pub(crate) fn vl_emit_done_terminal(
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    generated: usize,
+    prefill_tokens: usize,
+    t0: Instant,
+    t_prefill: Instant,
+) {
+    let t_end = Instant::now();
+    let total_s = t_end.duration_since(t0).as_secs_f64();
+    let prefill_s = t_prefill.duration_since(t0).as_secs_f64();
+    let decode_s = t_end.duration_since(t_prefill).as_secs_f64();
+    let tok_s = if total_s > 0.0 {
+        generated as f64 / total_s
+    } else {
+        0.0
+    };
+    let prefill_tok_s = if prefill_s > 0.0 {
+        prefill_tokens as f64 / prefill_s
+    } else {
+        0.0
+    };
+    let decode_tok_s = if decode_s > 0.0 {
+        generated as f64 / decode_s
+    } else {
+        0.0
+    };
+    let pending_done = serde_json::json!({
+        "type": "done",
+        "id": id,
+        "tokens": generated,
+        "tok_s": (tok_s * 10.0).round() / 10.0,
+        "prefill_tokens": prefill_tokens,
+        "prefill_ms": ((prefill_s * 1000.0) * 10.0).round() / 10.0,
+        "prefill_tok_s": (prefill_tok_s * 10.0).round() / 10.0,
+        "decode_tok_s": (decode_tok_s * 10.0).round() / 10.0,
+        "ttft_ms": ((prefill_s * 1000.0) * 10.0).round() / 10.0,
+        "attempt_id": active_attempt_id(),
+    });
+    match await_client_terminal_commit(stdout, id, &pending_done) {
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_active_route_done_value(stdout, &pending_done)
+        }
+        ClientTerminalDecision::Abort => {
+            crate::ar::emit_active_route_cancel(stdout, id, generated);
+        }
+    }
+}
+
 pub enum ImageSource<'a> {
     Path(&'a str),
     Base64(&'a str),
@@ -1371,7 +1425,25 @@ pub fn generate_vl(
         pos_offset: 0,
         section: mc.section,
     });
-    // `hidden_rb` stays None until VL decode actually runs the drafter.
+    // Capture the target's hidden states into the DFlash drafter's ring as a
+    // side effect of the prefill already running. `Speculator::prefill` cannot
+    // do this for VL: it seeds from TOKEN IDS, and image positions are
+    // embeddings with no token spelling. `m.speculator` and `m.state` are
+    // disjoint fields, so this borrow coexists with the bundle's. Taken only
+    // when the gated path will consume it -- capture costs staging writes plus
+    // a per-chunk ring commit.
+    let mut dflash_hidden = if vl_dflash_decode_enabled() {
+        m.speculator
+            .as_mut()
+            .and_then(|sp| {
+                sp.as_any_mut()
+                    .downcast_mut::<hipfire_arch_qwen35::dflash_spec::DflashSpeculator>()
+            })
+            .map(|sp| sp.hidden_rb_mut())
+    } else {
+        None
+    };
+    // Historical note: hidden_rb stayed None until VL decode ran the drafter.
     // Capturing hidden states costs staging writes plus a per-chunk ring
     // commit, and `prime_from_hidden` costs a download, scatter and backfill
     // — all wasted while decode is still AR. `DflashSpeculator::hidden_rb_mut`
@@ -1387,7 +1459,7 @@ pub fn generate_vl(
         kv,
         dn,
         scratch,
-        None, // hidden_rb: see the note above
+        dflash_hidden.as_deref_mut(),
         None, // per_token_hidden_out
         None, // gdn_tape
         None, // tree_verify
@@ -1399,6 +1471,7 @@ pub fn generate_vl(
         mrope_batch,
         Some(&|| check_abort(id)),
     );
+    drop(dflash_hidden);
     if let Err(e) = prefill_res {
         vl_forward_fail(
             stdout,
@@ -1609,6 +1682,101 @@ pub fn generate_vl(
     // attractor loops that the think cap and repeat penalty miss.
     let loop_guard =
         hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get());
+
+    // ── Gated speculative decode for image turns ────────────────────────
+    //
+    // Placed here because nothing between the prefill and this point touches
+    // the bundle borrows, so NLL lets the slot guard re-borrow `m` on a path
+    // that returns. `m.tokenizer`, `m.speculator`, `m.state` and
+    // `m.model_path` are disjoint fields and coexist.
+    if vl_dflash_decode_enabled() && m.speculator.is_some() {
+        let rope_delta = mrope.map(|mc| mc.rope_delta).unwrap_or(0);
+        let eos_tok = config.eos_token;
+        let first_token = next_token;
+        // Prime the drafter from the hidden states the prefill just captured,
+        // rather than re-running the target over token ids (which cannot
+        // reproduce a VL prompt).
+        let primed = m
+            .speculator
+            .as_mut()
+            .and_then(|sp| {
+                sp.as_any_mut()
+                    .downcast_mut::<hipfire_arch_qwen35::dflash_spec::DflashSpeculator>()
+            })
+            .map(|sp| sp.prime_from_hidden(gpu, prompt_tokens.len()));
+        match primed {
+            Some(Ok(())) => {
+                let mut spec = m.speculator.take().unwrap();
+                let outcome = (|| -> Result<(usize, usize, usize), String> {
+                    let mut guard = hipfire_loader::spec_build::Qwen35SlotGuard::take(
+                        &mut m.state,
+                        &m.model_path,
+                    )?;
+                    let target = guard.model_slot()? as &mut dyn hipfire_runtime::spec::SpecTarget;
+                    run_vl_qwen35_dflash_loop(
+                        target,
+                        spec.as_mut(),
+                        m.tokenizer.as_ref().unwrap(),
+                        gpu,
+                        stdout,
+                        id,
+                        &prompt_tokens,
+                        first_token,
+                        rope_delta,
+                        max_tokens,
+                        eos_tok,
+                        im_end_token,
+                        started_in_think,
+                        seed,
+                        temp,
+                    )
+                })();
+                m.speculator = Some(spec);
+                match outcome {
+                    Ok((gen, proposed, accepted)) => {
+                        eprintln!(
+                            "[daemon/vl] dflash decode: generated={gen} proposed={proposed} \
+                             accepted={accepted} rope_delta={rope_delta}"
+                        );
+                        vl_emit_done_terminal(stdout, id, gen, prefill_tokens, t0, t_prefill);
+                        return;
+                    }
+                    Err(e) => {
+                        // Fail loudly rather than fall through to the AR loop:
+                        // the drafter has already advanced target KV, so AR
+                        // would decode from inconsistent state.
+                        //
+                        // Deliberately NOT `vl_forward_fail`: that takes the
+                        // bundle's `kv`/`dn` borrows, which would keep them
+                        // live across the slot guard above and make this branch
+                        // unborrowable. The guard's Drop restores the bundle,
+                        // and the daemon force-resets the conversation on the
+                        // next VL dispatch, so the rollback those arguments
+                        // would have performed is already covered.
+                        m.seq_pos = 0;
+                        m.conversation_tokens.clear();
+                        crate::dense::emit_active_attempt_error(
+                            stdout,
+                            Some(id),
+                            &format!("vl dflash decode: {e}"),
+                            "gpu",
+                            true,
+                            false,
+                        );
+                        return;
+                    }
+                }
+            }
+            Some(Err(e)) => {
+                // Priming failed before any target state moved — the AR loop
+                // below is still safe to run.
+                eprintln!("[daemon/vl] dflash prime failed ({e}) — falling back to AR decode");
+            }
+            None => {
+                eprintln!("[daemon/vl] speculator is not DFlash — AR decode");
+            }
+        }
+    }
 
     'vl_generate: while generated < max_tokens {
         // Decode-side client-cancel poll — roll back synchronously (same
@@ -2043,45 +2211,7 @@ pub fn generate_vl(
     // Flush any trailing partial think marker as ordinary text in its
     // current channel (text-AR finish parity) before the terminal.
     vl_finish_think_routing(stdout, id, &mut vl_filter, &mut vl_think);
-    let t_end = Instant::now();
-    let total_s = t_end.duration_since(t0).as_secs_f64();
-    let prefill_s = t_prefill.duration_since(t0).as_secs_f64();
-    let decode_s = t_end.duration_since(t_prefill).as_secs_f64();
-    let tok_s = if total_s > 0.0 {
-        generated as f64 / total_s
-    } else {
-        0.0
-    };
-    let prefill_tok_s = if prefill_s > 0.0 {
-        prefill_tokens as f64 / prefill_s
-    } else {
-        0.0
-    };
-    let decode_tok_s = if decode_s > 0.0 {
-        generated as f64 / decode_s
-    } else {
-        0.0
-    };
-    let pending_done = serde_json::json!({
-        "type": "done",
-        "id": id,
-        "tokens": generated,
-        "tok_s": (tok_s * 10.0).round() / 10.0,
-        "prefill_tokens": prefill_tokens,
-        "prefill_ms": ((prefill_s * 1000.0) * 10.0).round() / 10.0,
-        "prefill_tok_s": (prefill_tok_s * 10.0).round() / 10.0,
-        "decode_tok_s": (decode_tok_s * 10.0).round() / 10.0,
-        "ttft_ms": ((prefill_s * 1000.0) * 10.0).round() / 10.0,
-        "attempt_id": active_attempt_id(),
-    });
-    match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => {
-            crate::ar::emit_active_route_done_value(stdout, &pending_done)
-        }
-        ClientTerminalDecision::Abort => {
-            crate::ar::emit_active_route_cancel(stdout, id, generated);
-        }
-    }
+    vl_emit_done_terminal(stdout, id, generated, prefill_tokens, t0, t_prefill);
 }
 
 pub fn generate_vl_dots_ocr(
