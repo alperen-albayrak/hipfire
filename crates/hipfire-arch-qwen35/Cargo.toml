@@ -61,6 +61,11 @@ path = "examples/test_dflash_hidden_scatter_gfx1100.rs"
 required-features = ["deltanet"]
 
 [[example]]
+name = "test_spec_rope_phase_bias_parity"
+path = "examples/test_spec_rope_phase_bias_parity.rs"
+required-features = ["deltanet"]
+
+[[example]]
 name = "test_dflash_snapshot_bulk_gfx1100"
 path = "examples/test_dflash_snapshot_bulk_gfx1100.rs"
 required-features = ["deltanet"]
