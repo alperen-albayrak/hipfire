@@ -6,7 +6,7 @@
 //! the new mrope kernels reproduce rope_partial_halfsplit_f32 EXACTLY in
 //! that case — which is also why gating mrope on image presence is safe.
 //!
-//! Run: cargo run --release -p rdna-compute --example test_mrope_rope_parity --features deltanet
+//! Run: cargo run --release -p rdna-compute --example test_mrope_rope_parity --features lab,deltanet
 
 use rdna_compute::Gpu;
 
@@ -41,18 +41,38 @@ fn main() {
     // Candidate: mrope with t == h == w.
     let q2 = gpu.upload_f32(&qd, &[nhq * hd]).unwrap();
     let k2 = gpu.upload_f32(&kd, &[nhk * hd]).unwrap();
-    let p3: Vec<u8> = [pos, pos, pos].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let p3: Vec<u8> = [pos, pos, pos]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
     let p2 = gpu.hip.malloc(12).unwrap();
     gpu.hip.memcpy_htod(&p2, &p3).unwrap();
     gpu.rope_mrope_halfsplit_f32(&q2, &k2, &p2, nhq, nhk, hd, n_rot, freq_base, section)
         .unwrap();
     gpu.hip.device_synchronize().unwrap();
 
-    let (a, b) = (gpu.download_f32(&q1).unwrap(), gpu.download_f32(&q2).unwrap());
-    let (c, d) = (gpu.download_f32(&k1).unwrap(), gpu.download_f32(&k2).unwrap());
-    let dq = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-    let dk = c.iter().zip(&d).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+    let (a, b) = (
+        gpu.download_f32(&q1).unwrap(),
+        gpu.download_f32(&q2).unwrap(),
+    );
+    let (c, d) = (
+        gpu.download_f32(&k1).unwrap(),
+        gpu.download_f32(&k2).unwrap(),
+    );
+    let dq = a
+        .iter()
+        .zip(&b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max);
+    let dk = c
+        .iter()
+        .zip(&d)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max);
     println!("max|dq| = {dq:.3e}   max|dk| = {dk:.3e}");
-    assert!(dq == 0.0 && dk == 0.0, "mrope with t==h==w must be BIT-IDENTICAL to 1D rope");
+    assert!(
+        dq == 0.0 && dk == 0.0,
+        "mrope with t==h==w must be BIT-IDENTICAL to 1D rope"
+    );
     println!("PASS: mrope degenerates exactly to 1D RoPE");
 }
