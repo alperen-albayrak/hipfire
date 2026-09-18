@@ -10,9 +10,9 @@ use super::batch::BatchSemantics;
 use super::batch::PrefillBatchScratch;
 use super::config::DflashFusionCtx;
 use super::config::LayerType;
-use super::config::MaskEmbedOverride;
 use super::config::Qwen35Config;
 use super::config::TreeVerifyCtx;
+use super::config::{MaskEmbedOverride, MropeBatch};
 use super::forward::checked_kv_end;
 use super::forward::forward_scratch;
 use super::forward::forward_scratch_with_hidden;
@@ -391,7 +391,6 @@ fn prefill_max_batch_for_arch(arch: &str, fp8_chunk512: bool) -> usize {
         PREFILL_MAX_BATCH
     }
 }
-
 
 fn explicit_prefill_max_batch() -> Option<usize> {
     hipfire_config::developer_var("HIPFIRE_PREFILL_MAX_BATCH")
@@ -833,6 +832,7 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
         None, // max_layer: single-chunk captured path always runs the full stack
         None, // routed_out: non-EP single-GPU path
         fusion,
+        None,
     )
 }
 
@@ -919,6 +919,7 @@ pub fn forward_prefill_batch_capped(
         true,
         Some(max_batch_cap),
         DflashFusionCtx::Off,
+        None,
     )
 }
 
@@ -1018,6 +1019,7 @@ pub fn forward_prefill_batch_with_pbs_opts(
         needs_last_token_logits,
         None,
         fusion,
+        None,
     )
 }
 
@@ -1041,6 +1043,7 @@ fn forward_prefill_batch_with_pbs_opts_inner(
     needs_last_token_logits: bool,
     max_batch_cap: Option<usize>,
     fusion: DflashFusionCtx,
+    mrope: Option<MropeBatch<'_>>,
 ) -> HipResult<()> {
     // Plain single-token AR decode? Only then is the per-token `forward_scratch`
     // call below eligible for the AR-forward hipGraph (capture/replay). Any spec
@@ -1395,6 +1398,7 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                 max_layer,
                 None, // routed_out: non-EP single-GPU path
                 fusion,
+                mrope,
             )?;
             if let Some(rb) = hidden_rb.as_mut() {
                 // Scatter fixed-offset staging writes (done inside the chunk)
@@ -3933,6 +3937,7 @@ pub(crate) fn forward_prefill_chunk(
     max_layer: Option<usize>,
     routed_out: Option<&GpuTensor>,
     fusion: DflashFusionCtx,
+    mrope: Option<MropeBatch<'_>>,
 ) -> HipResult<()> {
     forward_batch_chunk_impl(
         gpu,
@@ -3958,6 +3963,7 @@ pub(crate) fn forward_prefill_chunk(
         routed_out,
         BatchSemantics::Sequential,
         fusion,
+        mrope,
     )
 }
 #[allow(clippy::too_many_arguments)]
@@ -4192,20 +4198,25 @@ pub(crate) fn batch_chunk_embed_tokens(
     if do_embed {
         if let Some(ovr) = mask_override {
             assert!(
-                ovr.slot < n,
-                "MaskEmbedOverride.slot ({}) must be < n ({})",
+                !ovr.embed.is_empty() && ovr.embed.len() % dim == 0,
+                "MaskEmbedOverride.embed.len() ({}) must be a non-zero multiple \
+                 of config.dim ({})",
+                ovr.embed.len(),
+                dim,
+            );
+            let rows = ovr.embed.len() / dim;
+            assert!(
+                ovr.slot + rows <= n,
+                "MaskEmbedOverride writes rows {}..{} but the batch holds {}",
                 ovr.slot,
+                ovr.slot + rows,
                 n,
             );
-            assert_eq!(
-                ovr.embed.len(),
-                dim,
-                "MaskEmbedOverride.embed.len() ({}) must equal config.dim ({})",
-                ovr.embed.len(),
-                dim,
-            );
-            let bytes: &[u8] =
-                unsafe { std::slice::from_raw_parts(ovr.embed.as_ptr() as *const u8, dim * 4) };
+            // `x_batch` rows are `dim_row_bytes == dim * 4` and contiguous, so
+            // a multi-row override is a single copy, not `rows` of them.
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(ovr.embed.as_ptr() as *const u8, ovr.embed.len() * 4)
+            };
             let offset = ovr.slot * dim_row_bytes;
             gpu.hip
                 .memcpy_htod_offset(&pbs.x_batch.buf, offset, bytes)?;
@@ -4224,6 +4235,7 @@ pub(crate) fn batch_chunk_upload_positions(
     n: usize,
     tree_verify: Option<TreeVerifyCtx<'_>>,
     pre_uploaded: bool,
+    mrope: Option<MropeBatch<'_>>,
 ) -> HipResult<()> {
     // ── 1b. Upload positions array ────────────────────────────────────────
     //
@@ -4270,6 +4282,22 @@ pub(crate) fn batch_chunk_upload_positions(
                 unsafe { std::slice::from_raw_parts(tv.positions.as_ptr() as *const u8, n * 4) };
             gpu.hip.memcpy_htod(&pbs.rope_positions.buf, rope_bytes)?;
         }
+    }
+
+    // M-RoPE positions, uploaded ONCE per chunk rather than per layer. The
+    // per-token VL path makes the same point about its 12-byte upload: the
+    // value is layer-invariant, so a per-layer re-upload is pure blocking H2D.
+    // `[[i32; 3]]` is contiguous, so the whole array is one memcpy in the
+    // `positions[b * 3 + axis]` layout the kernel reads.
+    if let Some(mb) = mrope {
+        assert_eq!(
+            mb.positions.len(),
+            n,
+            "MropeBatch.positions must hold exactly one (t, h, w) triple per token",
+        );
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(mb.positions.as_ptr() as *const u8, n * 3 * 4) };
+        gpu.hip.memcpy_htod(&pbs.mrope_positions.buf, bytes)?;
     }
 
     Ok(())
@@ -5834,6 +5862,7 @@ fn batch_chunk_full_attn_prepare(
     kv_layer_idx: usize,
     layer_idx: usize,
     fusion: DflashFusionCtx,
+    mrope: Option<MropeBatch<'_>>,
 ) -> HipResult<()> {
     // S6-fa-prep-q8-pair: exact gfx1100 fold of steps 3-5 (deinterleave +
     // Q/K rmsnorm + half-split RoPE, 4 launches) into one
@@ -5857,6 +5886,10 @@ fn batch_chunk_full_attn_prepare(
         && config.head_dim == 256
         && fa_prep_n_rot == 64;
     let fa_prep_fused_ok = fusion == DflashFusionCtx::ChainVerify
+        // The fused gfx1100 prep applies 1-D half-split RoPE internally and
+        // has no 3-axis variant, so it cannot serve a VL chunk. gfx1201 never
+        // takes this arm anyway; the guard is for gfx1100 correctness.
+        && mrope.is_none()
         && gpu.arch_caps.is_gfx1100()
         && !gpu.flags.fa_batch_fuse_off
         && !gpu.flags.rope_interleaved_legacy
@@ -5960,18 +5993,38 @@ fn batch_chunk_full_attn_prepare(
         } else {
             &pbs.positions
         };
-        gpu.rope_partial_interleaved_f32_batched(
-            &pbs.fa_q_batch,
-            &pbs.fa_k_batch,
-            rope_pos_buf,
-            config.n_heads,
-            config.n_kv_heads,
-            config.head_dim,
-            n_rot,
-            config.rope_theta,
-            n,
-            kv_cache.compact_offset as i32,
-        )?;
+        match mrope {
+            // VL: 3-axis positions uploaded once per chunk by
+            // `batch_chunk_upload_positions`. `pos_offset` carries the
+            // conversation cursor for a resumed prefill; `compact_offset`
+            // still applies on top so Q/K rotate at absolute phase after
+            // eviction, exactly as the 1D arm does.
+            Some(mb) => gpu.rope_mrope_halfsplit_f32_batched(
+                &pbs.fa_q_batch,
+                &pbs.fa_k_batch,
+                &pbs.mrope_positions.buf,
+                config.n_heads,
+                config.n_kv_heads,
+                config.head_dim,
+                n_rot,
+                config.rope_theta,
+                n,
+                mb.pos_offset + kv_cache.compact_offset as i32,
+                mb.section,
+            )?,
+            None => gpu.rope_partial_interleaved_f32_batched(
+                &pbs.fa_q_batch,
+                &pbs.fa_k_batch,
+                rope_pos_buf,
+                config.n_heads,
+                config.n_kv_heads,
+                config.head_dim,
+                n_rot,
+                config.rope_theta,
+                n,
+                kv_cache.compact_offset as i32,
+            )?,
+        }
     }
 
     // 6–7. Batched KV write + flash attention (via dispatch).
@@ -6283,6 +6336,7 @@ pub(crate) fn batch_chunk_full_attn_attn(
     layer_idx: usize,
     epilogue: BatchEpilogue<'_>,
     fusion: DflashFusionCtx,
+    mrope: Option<MropeBatch<'_>>,
 ) -> HipResult<()> {
     // Fully batched FA layer. Mirrors the FA branch of
     // forward_scratch_layers kernel-for-kernel, but every
@@ -6308,6 +6362,7 @@ pub(crate) fn batch_chunk_full_attn_attn(
         kv_layer_idx,
         layer_idx,
         fusion,
+        mrope,
     )?;
 
     batch_chunk_full_attn_output_projection(
@@ -8092,6 +8147,9 @@ pub(crate) fn forward_batch_chunk_impl(
     routed_out: Option<&GpuTensor>,
     batch_semantics: BatchSemantics<'_>,
     fusion: DflashFusionCtx,
+    // Appended rather than inserted: several call sites pass long runs of
+    // positional `None`, where a misplaced Option would still typecheck.
+    mrope: Option<MropeBatch<'_>>,
 ) -> HipResult<()> {
     let n = tokens.len();
     debug_assert!(n > 0);
@@ -8176,6 +8234,7 @@ pub(crate) fn forward_batch_chunk_impl(
         n,
         tree_verify,
         pre_uploaded,
+        mrope,
     )?;
 
     let fa_arch = gpu.arch.as_str();
@@ -8297,6 +8356,7 @@ pub(crate) fn forward_batch_chunk_impl(
                     layer_idx,
                     BatchEpilogue::Residual,
                     fusion,
+                    mrope,
                 )?;
                 batch_chunk_full_attn_ffn(
                     gpu,
@@ -9185,10 +9245,28 @@ mod tests {
     fn q8_multirow_attn_rejects_replay_recording_on_supported_arches() {
         for arch in ["gfx1100", "gfx1201"] {
             assert!(q8_multirow_attn_admitted(
-                arch, true, 256, 8, 8192, Some(4096), false, false, false, false,
+                arch,
+                true,
+                256,
+                8,
+                8192,
+                Some(4096),
+                false,
+                false,
+                false,
+                false,
             ));
             assert!(!q8_multirow_attn_admitted(
-                arch, true, 256, 8, 8192, Some(4096), false, false, false, true,
+                arch,
+                true,
+                256,
+                8,
+                8192,
+                Some(4096),
+                false,
+                false,
+                false,
+                true,
             ));
         }
     }

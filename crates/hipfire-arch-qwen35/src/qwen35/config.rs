@@ -87,8 +87,38 @@ pub(crate) fn f16_lm_head_mode_from_config() -> F16LmHeadMode {
 ///     entire mask block fits in one chunk by construction.)
 #[derive(Clone, Copy)]
 pub struct MaskEmbedOverride<'a> {
+    /// Index of the FIRST batch row this override writes.
     pub slot: usize,
+    /// Row-major embeddings, `k * config.dim` values for `k >= 1` contiguous
+    /// rows starting at `slot`. `x_batch` rows are `dim * 4` bytes and
+    /// contiguous, so any `k` is one memcpy.
+    ///
+    /// Originally single-row (the MTP probe's mask sentinel); widened for VL,
+    /// whose visual tokens occupy one contiguous span. The `Mask` in the name
+    /// is now historical — a rename is deferred so this stays a behaviour
+    /// change rather than a rename mixed into one.
     pub embed: &'a [f32],
+}
+
+/// Per-token 3-axis M-RoPE positions for one batched prefill chunk.
+///
+/// `None` at a call site means the batch keeps the scalar-position 1-D RoPE
+/// path, byte for byte. Supplying it switches that chunk to
+/// `rope_mrope_halfsplit_f32_batched`, which is proven bit-identical to the
+/// 1-D kernel when all three axes are equal — see
+/// `rdna-compute/examples/test_mrope_rope_parity_batched.rs`, measured on
+/// gfx1201 at `pos_offset` 0, 713 and 4096.
+#[derive(Clone, Copy)]
+pub struct MropeBatch<'a> {
+    /// `[n][3]` row-major (t, h, w), one triple per token in the chunk.
+    /// Exactly the layout `build_mrope_positions` produces and the kernel
+    /// reads (`positions[b * 3 + axis]`).
+    pub positions: &'a [[i32; 3]],
+    /// Added to every axis by the kernel: the cross-turn position cursor for
+    /// a resumed prefill, and `compact_offset` after eviction. 0 otherwise.
+    pub pos_offset: i32,
+    /// `Qwen35Config::mrope_section`.
+    pub section: [usize; 3],
 }
 
 /// Frozen AR/verify discriminator for the DFlash launch-fusion project.

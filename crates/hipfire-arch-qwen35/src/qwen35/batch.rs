@@ -1798,6 +1798,7 @@ pub fn forward_decode_batch_prepared(
             active_mask,
         },
         DflashFusionCtx::Off,
+        None,
     )?;
 
     let logits = state.logits.sub_offset(0, n * config.vocab_size);

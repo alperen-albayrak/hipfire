@@ -5242,8 +5242,18 @@ pub(crate) fn forward_prefill_dense_tp_with_pbs_capture(
         ));
     }
     let last_n = forward_prefill_dense_tp_batched(
-        gpus, shard, weights, configs, tokens, start_pos, kv_caches, dn_states, scratches, pbs,
-        partials, Some(captures),
+        gpus,
+        shard,
+        weights,
+        configs,
+        tokens,
+        start_pos,
+        kv_caches,
+        dn_states,
+        scratches,
+        pbs,
+        partials,
+        Some(captures),
     )?;
     debug_assert_eq!(last_n, n);
     gpus.devices[0].bind_thread()?;
@@ -5380,6 +5390,7 @@ fn forward_prefill_dense_tp_batched(
                         n,
                         None,
                         false,
+                        None,
                     )?;
                     Ok(())
                 })();
@@ -5443,8 +5454,7 @@ fn forward_prefill_dense_tp_batched(
                         if process_res.is_err() {
                             break;
                         }
-                        if let Err(e) =
-                            dense_tp_allreduce_batched(gpus, pbs_vec, partials, n, dim)
+                        if let Err(e) = dense_tp_allreduce_batched(gpus, pbs_vec, partials, n, dim)
                         {
                             process_res = Err(e);
                             break;
@@ -5456,9 +5466,7 @@ fn forward_prefill_dense_tp_batched(
                                     let caps = captures.as_ref().ok_or_else(|| {
                                         HipError::new(0, "dense TP capture missing")
                                     })?;
-                                    if let Some(slot) =
-                                        caps[rank].hidden.extract_slot(layer_idx)
-                                    {
+                                    if let Some(slot) = caps[rank].hidden.extract_slot(layer_idx) {
                                         gpus.devices[rank].bind_thread()?;
                                         caps[rank].hidden.write_rows_to_staging(
                                             &mut gpus.devices[rank],
@@ -5503,8 +5511,7 @@ fn forward_prefill_dense_tp_batched(
                         if process_res.is_err() {
                             break;
                         }
-                        if let Err(e) =
-                            dense_tp_allreduce_batched(gpus, pbs_vec, partials, n, dim)
+                        if let Err(e) = dense_tp_allreduce_batched(gpus, pbs_vec, partials, n, dim)
                         {
                             process_res = Err(e);
                             break;
@@ -5516,9 +5523,7 @@ fn forward_prefill_dense_tp_batched(
                                     let caps = captures.as_ref().ok_or_else(|| {
                                         HipError::new(0, "dense TP capture missing")
                                     })?;
-                                    if let Some(slot) =
-                                        caps[rank].hidden.extract_slot(layer_idx)
-                                    {
+                                    if let Some(slot) = caps[rank].hidden.extract_slot(layer_idx) {
                                         gpus.devices[rank].bind_thread()?;
                                         caps[rank].hidden.write_rows_to_staging(
                                             &mut gpus.devices[rank],
@@ -5573,6 +5578,7 @@ fn forward_prefill_dense_tp_batched(
                                 layer_idx,
                                 BatchEpilogue::Partial(partials[rank]),
                                 DflashFusionCtx::Off,
+                                None,
                             ) {
                                 process_res = Err(e);
                                 break;
@@ -5581,8 +5587,7 @@ fn forward_prefill_dense_tp_batched(
                         if process_res.is_err() {
                             break;
                         }
-                        if let Err(e) =
-                            dense_tp_allreduce_batched(gpus, pbs_vec, partials, n, dim)
+                        if let Err(e) = dense_tp_allreduce_batched(gpus, pbs_vec, partials, n, dim)
                         {
                             process_res = Err(e);
                             break;
@@ -5594,9 +5599,7 @@ fn forward_prefill_dense_tp_batched(
                                     let caps = captures.as_ref().ok_or_else(|| {
                                         HipError::new(0, "dense TP capture missing")
                                     })?;
-                                    if let Some(slot) =
-                                        caps[rank].hidden.extract_slot(layer_idx)
-                                    {
+                                    if let Some(slot) = caps[rank].hidden.extract_slot(layer_idx) {
                                         gpus.devices[rank].bind_thread()?;
                                         caps[rank].hidden.write_rows_to_staging(
                                             &mut gpus.devices[rank],
@@ -5641,8 +5644,7 @@ fn forward_prefill_dense_tp_batched(
                         if process_res.is_err() {
                             break;
                         }
-                        if let Err(e) =
-                            dense_tp_allreduce_batched(gpus, pbs_vec, partials, n, dim)
+                        if let Err(e) = dense_tp_allreduce_batched(gpus, pbs_vec, partials, n, dim)
                         {
                             process_res = Err(e);
                             break;
@@ -5654,9 +5656,7 @@ fn forward_prefill_dense_tp_batched(
                                     let caps = captures.as_ref().ok_or_else(|| {
                                         HipError::new(0, "dense TP capture missing")
                                     })?;
-                                    if let Some(slot) =
-                                        caps[rank].hidden.extract_slot(layer_idx)
-                                    {
+                                    if let Some(slot) = caps[rank].hidden.extract_slot(layer_idx) {
                                         gpus.devices[rank].bind_thread()?;
                                         caps[rank].hidden.write_rows_to_staging(
                                             &mut gpus.devices[rank],
@@ -5701,8 +5701,8 @@ fn forward_prefill_dense_tp_batched(
             }
             offset += n;
         }
-    Ok(last_chunk_n)
-}
+        Ok(last_chunk_n)
+    }
 }
 
 /// Layer-granular batched dense-TP prefill. Chunks with the existing
@@ -5783,8 +5783,18 @@ pub fn forward_prefill_dense_tp(
     let pbs_refs: Vec<&PrefillBatchScratch> = pbs_vec.iter().collect();
     let partial_refs: Vec<&GpuTensor> = partials.iter().collect();
     let last_chunk_n = match forward_prefill_dense_tp_batched(
-        gpus, shard, weights, configs, tokens, start_pos, kv_caches, dn_states, scratches, &pbs_refs,
-        &partial_refs, None,
+        gpus,
+        shard,
+        weights,
+        configs,
+        tokens,
+        start_pos,
+        kv_caches,
+        dn_states,
+        scratches,
+        &pbs_refs,
+        &partial_refs,
+        None,
     ) {
         Ok(n) => n,
         Err(e) => {
