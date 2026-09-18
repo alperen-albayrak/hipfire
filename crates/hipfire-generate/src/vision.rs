@@ -1337,15 +1337,21 @@ pub fn generate_vl(
     // advance m.seq_pos in-loop and call maybe_evict / maybe_downshift after
     // every committed write. Lazy VMM map/growth failures and adaptive
     // transition errors are request-scoped (no panic, no later token emit).
-    let mut visual_idx = 0usize;
-    for &token in prompt_tokens.iter() {
-        // Client-cancel poll. The encoder phase before this loop cannot be
-        // interrupted mid-kernel, so prefill's first iteration is where an
-        // abort signalled during vision_forward takes effect. The terminal
-        // MUST be the canonical cancelled pair: falling through to the done
-        // handshake on an aborted attempt strands the serve admission guard
-        // permanently (2026-08-27 ledger finding c — slot wedged ≥3 min on
-        // every mid-encode disconnect before these polls existed).
+    // Batched prefill. This replaces a per-token loop that ran at ~33 tok/s
+    // because `forward_scratch_embed_mrope` is one kernel launch per token,
+    // against ~630 tok/s for the batched text path on the same hardware. The
+    // visual rows go in as a contiguous embedding-span override and the 3-axis
+    // positions as an `MropeBatch`, so the work is identical -- only the
+    // launch granularity changes.
+    //
+    // Chunked HERE as well as internally so client cancellation still lands
+    // between chunks. The per-token loop polled every token; dropping the poll
+    // entirely strands the serve admission guard on a mid-prefill disconnect
+    // (2026-08-27 ledger finding c, slot wedged >= 3 min).
+    const VL_PREFILL_ABORT_CHUNK: usize = 1024;
+    let image_span_start = prompt_tokens.iter().position(|&t| t == image_pad_id);
+    let mut off = 0usize;
+    while off < prompt_tokens.len() {
         if check_abort(id) {
             // Abort with uncommitted prefill state: roll back through the
             // canonical epilogue before the cancelled pair so the next
@@ -1367,34 +1373,50 @@ pub fn generate_vl(
             );
             return;
         }
-        if token == image_pad_id && visual_idx < n_visual_tokens {
-            let emb = &visual_tokens[visual_idx * config.dim..(visual_idx + 1) * config.dim];
-            if let Err(e) = qwen35::forward_scratch_embed_mrope(
-                gpu, weights, config, emb, m.seq_pos, kv, dn, scratch, mrope,
-            ) {
-                vl_forward_fail(
-                    stdout,
-                    id,
-                    "forward_scratch_embed (prefill)",
-                    e,
-                    gpu,
-                    dn,
-                    kv,
-                    &mut m.kv_adaptive,
-                    &mut m.seq_pos,
-                    &mut m.conversation_tokens,
-                    &mut m.prefill_checkpoints,
-                );
-                return;
-            }
-            visual_idx += 1;
-        } else if let Err(e) = qwen35::forward_scratch_mrope(
-            gpu, weights, config, token, m.seq_pos, kv, dn, scratch, mrope,
+        let end = (off + VL_PREFILL_ABORT_CHUNK).min(prompt_tokens.len());
+        let toks = &prompt_tokens[off..end];
+        // Visual rows intersecting this chunk, rebased to chunk-local slots.
+        // The span is contiguous, so this is a slice, not a gather.
+        let overrides = image_span_start.and_then(|st| {
+            let lo = st.max(off);
+            let hi = (st + n_visual_tokens).min(end);
+            (lo < hi).then(|| qwen35::MaskEmbedOverride {
+                slot: lo - off,
+                embed: &visual_tokens[(lo - st) * config.dim..(hi - st) * config.dim],
+            })
+        });
+        // `MropeCtx.positions` is already absolute (offset by `base`), so the
+        // kernel needs no further offset. `None` here keeps the scalar 1-D
+        // path, which is what a bailed mrope context must fall back to.
+        let mrope_batch = mrope.map(|mc| qwen35::MropeBatch {
+            positions: &mc.positions[off..end],
+            pos_offset: 0,
+            section: mc.section,
+        });
+        if let Err(e) = qwen35::forward_prefill_batch_with_pbs_opts(
+            gpu,
+            weights,
+            config,
+            toks,
+            m.seq_pos,
+            kv,
+            dn,
+            scratch,
+            None, // hidden_rb
+            None, // per_token_hidden_out
+            None, // gdn_tape
+            None, // tree_verify
+            None, // pbs_in: use the resident scratch
+            overrides,
+            None,  // max_layer
+            false, // needs_last_token_logits
+            qwen35::DflashFusionCtx::Off,
+            mrope_batch,
         ) {
             vl_forward_fail(
                 stdout,
                 id,
-                "forward_scratch (prefill)",
+                "forward_prefill_batch (vl prefill)",
                 e,
                 gpu,
                 dn,
@@ -1406,7 +1428,7 @@ pub fn generate_vl(
             );
             return;
         }
-        m.seq_pos += 1;
+        m.seq_pos += toks.len();
         if let Some(ref ev) = m.eviction {
             match ev.maybe_evict(gpu, kv, m.seq_pos) {
                 Ok(Some(hipfire_runtime::triattn::EvictionResult {
@@ -1451,6 +1473,7 @@ pub fn generate_vl(
         ) {
             return;
         }
+        off = end;
     }
 
     m.conversation_tokens.extend_from_slice(&prompt_tokens);
