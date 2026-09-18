@@ -425,6 +425,48 @@ fn prime_from_hidden(&mut self, gpu: &mut Gpu, prompt_len: usize)
 the `hidden_rb` argument of the Task 3 batched call (**the parameter already
 exists and is currently `None`**), and calls `prime_from_hidden` afterwards.
 
+### Prior art — how the references do vision + speculative decode
+
+Checked 2026-09-18 against llama.cpp, vLLM and SGLang. All three converge on
+the same shape, and none of them feeds visual embeddings to the drafter.
+
+- **llama.cpp (EAGLE3, `common/speculative.cpp:577`)** skips any batch that
+  carries embeddings outright:
+  `if (batch_in.token == nullptr || batch_in.embd != nullptr) { return true; }`
+  Since `mtmd` submits images exactly that way (`decode_embd_batch`), the
+  drafter simply never ingests image rows. No error, no disable — speculation
+  continues over the text with a hole where the image was. There is no
+  mtmd/spec incompatibility check in the server.
+- **vLLM (`v1/spec_decode/llm_base_proposer.py`)** warns and degrades:
+  "does not fully support multimodal models yet. **Proceeding with text-only
+  speculative decoding.**" It also hard-fails if the DRAFT itself wants
+  M-RoPE (`_raise_if_mrope`), and comments that the draft's M-RoPE setting —
+  not the target's — is what counts, because "draft models may be text-only
+  even if target is multimodal".
+- **SGLang** tolerates rather than skips: its EAGLE draft embedding "clamps
+  unconditionally (to tolerate multimodal pad sentinels)", and its DSpark
+  verify path excludes requests carrying `input_embeds` or
+  `multimodal_inputs` from position-bounding because "their visible token IDs
+  may not track cache positions".
+
+**What this means for hipfire.** The draft here is text-only 1-D —
+`dflash_spec.rs` contains zero mrope references — which is exactly the
+configuration all three references assume, so no M-RoPE work is needed on the
+draft side.
+
+hipfire is actually better placed than llama.cpp for the seeding: DFlash is
+seeded from TARGET hidden states, and the target computes real hidden states
+for image rows during its own VL prefill. So the rows exist and there is no
+hole to skip — unlike EAGLE3, which never sees them because it works off the
+batch.
+
+The residual issue is the draft's own token embedding at image positions,
+where the id is `image_pad` — a real vocab id with no meaning. Follow SGLang
+and tolerate it (clamp/accept) rather than special-case it: acceptance simply
+degrades for the few tokens following an image and recovers. Do NOT expect
+image-adjacent tau to match text; none of the references achieve that, and a
+low tau there is expected behaviour, not a bug to chase.
+
 **The remaining bulk is the decode loop, not the seeding.** `generate_vl` has a
 bespoke AR decode loop carrying think-routing (`<think>`/`</think>` pairing and
 force-close), the emit contract, abort polling, eviction and adaptive
