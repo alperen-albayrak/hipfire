@@ -637,6 +637,18 @@ impl DflashSpeculator {
         if prompt_len == 0 {
             return Err("prime_from_hidden: empty prompt".to_string());
         }
+        // Per-request drafter setup, mirroring the head of `prefill`. Omitting
+        // this faults the GPU: the draft keeps the previous request's
+        // upload/projection offsets, and priming on top of them reads out of
+        // bounds when the prompt length differs. Observed as
+        // "Memory access fault by GPU node-1 ... Page not present" on the first
+        // image turn after a text turn, which is exactly the stale-offset case.
+        //
+        // Always a full prime (never a cache hit): a VL prompt is reframed
+        // whole on every turn, so there is no retained prefix whose
+        // projections could be reused.
+        self.last_window = None;
+        self.df.draft_scratch.reset_upload_tracking();
         let block = crate::speculative::download_hidden_block(gpu, &self.df.hidden_rb, prompt_len)
             .map_err(|e| {
                 hipfire_runtime::reset_core::note_hip_error(&e, "qwen35::dflash_prime::download");
