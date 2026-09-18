@@ -2573,6 +2573,183 @@ pub fn decode_vl_dots_ocr_ngram(
     m.state = Some(Box::new(bundle));
     m.speculator = Some(spec);
 }
+/// Is DFlash decode wired for qwen35-VL image turns?
+///
+/// Default OFF. The repo gates comparable switches the same way
+/// (`HIPFIRE_JINJA_CHAT`, `HIPFIRE_DFLASH_VERIFY_PM4`, `vision.mode`), and this
+/// one changes how every image response is produced, so it ships dark until
+/// measured.
+pub(crate) fn vl_dflash_decode_enabled() -> bool {
+    hipfire_config::developer_var("HIPFIRE_VL_DFLASH")
+        .ok()
+        .as_deref()
+        == Some("1")
+}
+
+/// One accepted token's worth of the AR loop's post-forward contract.
+///
+/// The AR loop and the speculative loop MUST agree here: same emit path, same
+/// stop precedence, same bookkeeping order. Factoring it out is what keeps the
+/// two from drifting — the failure mode otherwise is a stop token honoured on
+/// one path and swallowed on the other, which reads as a truncated or
+/// runaway answer rather than an error.
+///
+/// Returns `true` when the turn should stop.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn vl_commit_decoded_token(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+    filter: &mut EosFilter,
+    think: &mut ThinkOutputRouter,
+    streamed_tokens: &mut Vec<u32>,
+    emitted_bytes: &mut usize,
+    token: u32,
+    eos_token: u32,
+    im_end_token: Option<u32>,
+    loop_guard: &hipfire_runtime::loop_guard::LoopGuard,
+) -> bool {
+    streamed_tokens.push(token);
+    let all_bytes = tokenizer.decode_bytes(streamed_tokens);
+    let new_bytes = &all_bytes[*emitted_bytes..];
+    let stop_from_emit = vl_route_decode_text(stdout, id, filter, think, new_bytes);
+    *emitted_bytes = all_bytes.len();
+    if stop_from_emit {
+        return true;
+    }
+    if token == eos_token || im_end_token == Some(token) || tokenizer.is_terminator(token) {
+        return true;
+    }
+    matches!(
+        loop_guard.check(streamed_tokens),
+        Some(hipfire_runtime::loop_guard::StopReason::NgramRepeat { .. })
+    )
+}
+
+/// Speculative decode for a qwen35-VL image turn.
+///
+/// Mirrors `run_dots_ocr_ngram_loop`'s shape — bundle and speculator taken OUT
+/// of `m` so the loop never touches it — with three VL-specific differences:
+///
+/// 1. The target is a `ModelSlot` obtained through `Qwen35SlotGuard`, not the
+///    bundle itself. The guard restores the bundle on drop.
+/// 2. `set_rope_phase_bias(rope_delta)` before the first step. `MropeCtx::pos3`
+///    puts decode steps at `pos + rope_delta`; a target rotating at plain `pos`
+///    yields wrong logits that DFlash's exact verify would faithfully
+///    reproduce. Proven by `test_spec_rope_phase_bias_parity`.
+/// 3. The drafter is seeded from hidden states the VL prefill captured, since
+///    `Speculator::prefill` seeds from token ids and a VL prompt's image
+///    positions have no token spelling.
+///
+/// Every accepted token goes through `vl_commit_decoded_token`, the same
+/// contract the AR loop uses. Emission granularity differs (a window, not a
+/// token) and that is safe: the channel router is delivery-shape invariant,
+/// pinned by `channel_split_is_invariant_to_delivery_chunking`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_vl_qwen35_dflash_loop(
+    target: &mut dyn hipfire_runtime::spec::SpecTarget,
+    spec: &mut dyn hipfire_runtime::spec::Speculator,
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    prompt_tokens: &[u32],
+    first_token: u32,
+    rope_delta: i32,
+    max_tokens: usize,
+    eos_token: u32,
+    im_end_token: Option<u32>,
+    started_in_think: bool,
+    seed: u32,
+    temp: f32,
+) -> Result<(usize, usize, usize), String> {
+    // Decode positions rotate at `pos + rope_delta` for a VL prompt.
+    target.set_rope_phase_bias(rope_delta);
+
+    let mut filter = EosFilter::new(crate::ar::qwen_ar_eos_filter_config());
+    let mut think = ThinkOutputRouter::new(started_in_think);
+    let loop_guard =
+        hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get());
+
+    let mut streamed_tokens: Vec<u32> = Vec::with_capacity(max_tokens);
+    let mut emitted_bytes = 0usize;
+    let mut generated = 0usize;
+    let (mut proposed, mut accepted) = (0usize, 0usize);
+
+    // The seed token came from the prefill's final logits, exactly as the AR
+    // loop's first sampled token does. Commit it through the shared path so a
+    // turn that stops immediately still emits identically on both routes.
+    let mut position = prompt_tokens.len();
+    let mut next_seed = first_token;
+    if vl_commit_decoded_token(
+        stdout,
+        id,
+        tokenizer,
+        &mut filter,
+        &mut think,
+        &mut streamed_tokens,
+        &mut emitted_bytes,
+        first_token,
+        eos_token,
+        im_end_token,
+        &loop_guard,
+    ) {
+        vl_finish_think_routing(stdout, id, &mut filter, &mut think);
+        return Ok((1, proposed, accepted));
+    }
+    generated += 1;
+    position += 1;
+
+    'outer: while generated < max_tokens {
+        if check_abort(id) {
+            break;
+        }
+        let step = spec
+            .step(
+                gpu,
+                target,
+                position,
+                seed,
+                &streamed_tokens,
+                None,
+                temp,
+                max_tokens - generated,
+            )
+            .map_err(|e| format!("vl dflash spec_step: {e}"))?;
+        proposed += step.proposed;
+        accepted += step.accepted;
+        next_seed = step.next_seed;
+
+        for &tok in step.emit.iter() {
+            if generated >= max_tokens {
+                break 'outer;
+            }
+            let stop = vl_commit_decoded_token(
+                stdout,
+                id,
+                tokenizer,
+                &mut filter,
+                &mut think,
+                &mut streamed_tokens,
+                &mut emitted_bytes,
+                tok,
+                eos_token,
+                im_end_token,
+                &loop_guard,
+            );
+            generated += 1;
+            position += 1;
+            if stop {
+                break 'outer;
+            }
+        }
+    }
+    let _ = next_seed;
+
+    vl_finish_think_routing(stdout, id, &mut filter, &mut think);
+    Ok((generated, proposed, accepted))
+}
+
 pub fn run_dots_ocr_ngram_loop(
     bundle: &mut hipfire_arch_dots_ocr::DotsOcrBundle,
     spec: &mut dyn hipfire_runtime::spec::Speculator,
