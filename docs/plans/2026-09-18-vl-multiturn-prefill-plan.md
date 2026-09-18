@@ -544,6 +544,45 @@ site noted), then `prime_from_hidden`.
 **Set the bias before stepping**: `target.set_rope_phase_bias(rope_delta)` from
 the request's `MropeCtx`, or every decode token rotates at the wrong phase.
 
+### Prerequisite finding (2026-09-18): "byte-identical to AR" is the WRONG gate
+
+Measured before building, on the TEXT path where both AR and DFlash already
+work, via `HIPFIRE_SPECULATION=off` (no config mutation needed). Greedy,
+temperature 0, fixed seed, `scripts/ar_spec_diff.py`:
+
+| | AR vs spec |
+|---|---|
+| text-short, text-multi, both image cases | **identical** |
+| text-prose | **DIVERGED** at char 169 — spec "two smaller whole numbers", AR "two smaller positive integers" |
+
+Same token count, different words. So a VL gate asserting token-for-token
+identity with AR would have failed for reasons unrelated to the change.
+
+The cause looks benign and is worth recording: verify runs a BATCHED forward,
+AR runs PER-TOKEN, and those two routes differ by ~7.5e-3 in logits (measured
+independently by the rope-phase parity harness). At a near-tie that flips the
+argmax, and the sequences part from there. AGENTS.md already notes
+"draft-target argmax disagreement on prose tokens".
+
+**Spec output IS deterministic**: identical across two runs and a server
+restart, all five cases. That is what makes a regression gate possible.
+
+**So the gate for the decode loop is:**
+
+1. **Determinism** — VL-spec output reproducible across runs/restarts. Catches
+   state leakage between requests, which is the failure a single run hides.
+2. **Prefix agreement vs VL-AR** — divergence no worse than the text baseline.
+   Text agreed for 169 chars before a near-tie; VL-spec diverging at token 1-2
+   means a position or seeding bug, not a near-tie.
+3. **Mechanism tests, already green** — rope-phase bit-identity
+   (`test_spec_rope_phase_bias_parity`) and channel-delivery invariance
+   (`vision.rs` tests).
+4. **tau > 1** — the drafter must actually accept something, else the wiring is
+   inert and passing tests prove nothing.
+
+Do NOT tighten (2) into byte-identity. It would be measuring the batched-vs-
+per-token float difference, not the correctness of this change.
+
 **Gate it.** Land behind an env flag defaulting OFF (the repo gates
 `HIPFIRE_JINJA_CHAT`, `HIPFIRE_DFLASH_VERIFY_PM4`, `vision_mode` the same way),
 so the port is reviewable and measurable without changing default behaviour.
