@@ -30,11 +30,29 @@ work; they compound on the same VRAM budget.
 
 ### KV cost per token
 
-Derived from `KTier::k_bytes_per_pos`
-(`crates/hipfire-dispatch/src/families/kv_tier.rs:116`) at Qwen3.8-27B geometry
-(H24 / KV4 / head_dim 256), across the full-attention layers only. DeltaNet
-layers carry fixed-size recurrent state and do not grow with context — that is
-what makes a 262K lane askable at all.
+**The allocation formula, verified against the allocator** — not the tier
+helper. `KvCache::new_gpu_asym3_*` (`crates/hipfire-runtime/src/llama.rs:6752`):
+
+```
+k_bph  = 4 + head_dim*3/8            = 100 B/head  →  400 B/pos   (asym3 K)
+v_bpp  = n_kv_heads*(head_dim/32)*34               → 1088 B/pos   (Q8 V)
+
+KV bytes = max_seq × n_full_attention_layers × (k_bytes_per_pos + v_bytes_per_pos)
+```
+
+Two properties of that allocator matter for sizing and were confirmed by code
+read, not assumed:
+
+- It allocates **upfront for `max_seq`** (`physical_cap`), not grown per token.
+  A conversation's KV footprint is fixed at load, by configuration.
+- It allocates **only for full-attention layers**. The `*_filtered`
+  constructors take an `is_kv_layer` mask, built at
+  `crates/hipfire-arch-qwen35/src/speculative.rs:896` as
+  `*t == LayerType::FullAttention`, and substitute a 1-element placeholder for
+  the rest. DeltaNet layers carry fixed-size recurrent state that does not grow
+  with context — that is what makes a 262K lane askable at all.
+
+At Qwen3.8-27B geometry (H24 / KV4 / head_dim 256):
 
 | K tier | B/pos/layer | with Q8 V | per token (16 layers) | 262,144 tokens |
 |---|---:|---:|---:|---:|
@@ -45,10 +63,56 @@ what makes a 262K lane askable at all.
 
 **The 16-layer count is NOT verified.** It comes from PrismML's "~75% linear /
 ~25% full" against 64 layers. Read it from the checkpoint's `config.json`
-before sizing anything on it — every row above scales linearly with it.
+before sizing anything on it — every absolute figure in this plan scales
+linearly with it.
+
+### What is robust, and what is not
+
+Separate the two, because they carry different confidence:
+
+**The Q8-over-fwht3 ratio is exact and assumption-free:**
+
+```
+2176 / 1488 = 1.4624
+```
+
+Both the full-attention layer count and `max_seq` cancel. "Q8 costs ~1.46×
+fwht3" holds whatever those turn out to be, and it is the number the asym3
+slot-kernel work (Tasks 4–6) is justified by.
+
+**The absolute pair (18.3 GB vs 12.5 GB for two 262K lanes) is an estimate**
+that scales with the layer count above. If the true count is 12, the pair
+becomes 13.7 / 9.4 GB — same ratio, different budget. Treat the absolutes as
+the shape of the problem, not as numbers to plan VRAM against, until the
+baseline row below is filled in.
 
 V at Q8 (1088 B) dominates once K drops below it, which is why fwht2 buys so
 little over fwht3 and why the V-quant ladder (lloyd4/3/2) exists separately.
+
+### Measured baseline on cachy-01 — TO BE FILLED
+
+Everything above is arithmetic. This row anchors it to the running system, and
+should be recorded before any capacity decision:
+
+| field | value |
+|---|---|
+| model + quant | qwen3.8-27b MQ4V2 |
+| model bytes on disk | — |
+| `max_seq` configured | — |
+| full-attention layer count (from `config.json`) | — |
+| KV bytes by the formula above | — |
+| VRAM high-water mark, 1 conversation | **~27 GB of 32** (observed, unquantified) |
+
+**The observation is already load-bearing, independent of the layer count.** At
+~27 GB with a ~14 GB model, KV plus everything else is ~13 GB **for one lane**.
+A second lane at the same context does not fit — it would want ~40 GB.
+Replacing a 14 GB model with Bonsai 2's 5.9 GB frees ~8 GB, taking headroom
+from ~5 GB to ~13 GB and roughly **doubling the KV budget at the same context
+setting**.
+
+That is the two-lane argument made from a measurement rather than from the
+estimate tables, and it does not depend on the unverified layer count. It is
+the strongest form of the case this plan rests on.
 
 ### Quality ladder
 
@@ -472,9 +536,22 @@ independent and separately reviewable. Task 0 and Task 2 are benchmark commits.
    Blocks Task 1.
 2. **The Hadamard contract** — block size, sign convention, normalisation.
    Blocks Task 1, and gets no error if wrong.
-3. **Full-attention layer count** for Qwen3.8-27B. Every capacity number
-   scales with it.
-4. **Whether asym3 prefill needs the WMMA sibling** to avoid trading a
+3. **Full-attention layer count** for Qwen3.8-27B. Every *absolute* capacity
+   number scales with it. The Q8/fwht3 ratio (1.4624) does not — see
+   "What is robust, and what is not".
+4. **The cachy-01 baseline row** — `max_seq`, model bytes, and the measured
+   VRAM high-water mark. Cheapest item here and it anchors everything else;
+   the ~27 GB observation is currently unquantified.
+5. **Whether asym3 prefill needs the WMMA sibling** to avoid trading a
    capacity win for a latency loss (Task 6).
-5. **What actually binds first** in the two-lane budget — the estimate excludes
+6. **What actually binds first** in the two-lane budget — the estimate excludes
    DeltaNet state, prefill scratch, and the drafter.
+7. **Long-context decode on gfx1201 is unmeasured.** The only long-context
+   decode data in tree is gfx1100 / qwen3.6 / fwht3 / no DFlash: 35.2 tok/s at
+   32,649 ctx
+   (`benchmarks/quality-baselines/results/2026-05-31-kv-vquant/longctx-decode-ab.txt`).
+   This plan sizes 262K lanes without knowing whether decode stays usable at
+   length. For scale, Inco's SPLASH reports 54 tok/s at 32K on Qwen3.8-27B on
+   M3+ Macs, against hipfire's ~140 tok/s at short context on gfx1201 — so the
+   short-context lead is large and the long-context behaviour is simply
+   unknown. Measure before committing to the context ceiling.
