@@ -1,4 +1,4 @@
-# Long-context: hipfire vs llama.cpp on one R9700 (gfx1201), 2026-09-21
+# Long-context: hipfire vs llama.cpp vs radiance/vLLM on one R9700 (gfx1201), 2026-09-21
 
 **One-line result: at 124K context llama.cpp is 7.5x faster at cold prefill and
 4.0x faster at decode than hipfire, on the same GPU, in the same hour — while
@@ -7,6 +7,58 @@ that costs hipfire 20.5 minutes to first token costs llama.cpp 2.8.
 
 hipfire is *faster* at short context. It collapses at long context; llama.cpp
 degrades gently. That difference is the finding.
+
+## Three-engine summary (added after the radiance run)
+
+Same GPU, same day, ~128K-token wikitext prompts, DFlash2 where available:
+
+| | hipfire | llama.cpp | **radiance/vLLM MXFP4** |
+|---|---:|---:|---:|
+| cold prefill @~128K | 101.2 t/s | 760.1 t/s | **~2,280 t/s** |
+| decode @~128K | 7.8 (DFlash2) | 15.1 (no spec) | **~55 (DFlash2)** |
+| wall: 128K prefill + 256 tok | ~1,259 s | ~185 s | **60.5 s** |
+
+radiance is **22x hipfire / 3x llama.cpp on prefill**, **7x hipfire / 3.6x
+llama.cpp on decode**. It also beats the akougkas.io llama.cpp production preset
+(47.5 t/s at 131k) while using DFlash2 rather than MTP.
+
+### radiance method and caveats
+
+`codeberg.org/ggz14/radiance-vllm-mxfp4`, image `stilldeadcode/vllm-radiance:0.9.3`,
+`amd/Qwen3.8-27B-Quark-AWQ-MXFP4` (~19 GiB) rewritten to mtp-fp8 by its setup,
+TP=1, `MAXLEN=131072`, `GPU_UTIL=0.98`, `kv_cache_dtype=fp8`, R4D attention
+backend, `SPEC_METHOD=dflash SPEC=7`.
+
+Decomposition avoided the prefix cache, which proved unreliable here (a repeat
+of the same prompt hit once, then did not — the KV cache holds only 131,437
+tokens, so one 128K request fills it):
+
+| prompt tokens | generated | wall |
+|---:|---:|---:|
+| 124,742 | 16 | 55.0 s |
+| 127,770 | 256 | 60.4 s |
+| 128,265 | 256 | 60.9 s / 61.0 s |
+
+The 16-token run is ~99% prefill => 124,742 / 54.6 s = ~2,280 t/s. Applying that
+to the 256-token runs leaves ~4.6 s for 256 tokens => ~56 t/s decode. The single
+prefix-cache hit that did occur (4.8 s for 256 tokens = 53 t/s) agrees from an
+independent route. Three fresh prompts reproduced the cold wall within 1%
+(60.4 / 60.9 / 61.0).
+
+**`SPEC_METHOD=mtp` does not work on this stack.** Engine init fails with a
+Dynamo assertion in the MTP head's `fc` layer under Quark fp8
+(`input_quant_fp8.py:190`, `assert (scale is not None) == self.static`). Their
+README documents `dflash` as the default and flags the MTP-native checkpoint as
+not load-tested. So these numbers may have headroom.
+
+**Only one full-context stream fits**: `GPU KV cache size: 131,437 tokens`,
+`Maximum concurrency for 131,072 tokens per request: 1.00x`, 31.2 of 31.9 GiB
+resident. Two concurrent 128K lanes need a shorter per-request context.
+
+**This revises the earlier "vLLM is out" conclusion in this document.** Upstream
+vLLM builds for gfx1201 but ships CDNA-only AITER kernels; this fork supplies
+the RDNA4 work upstream lacks, and the result is the fastest of the three by a
+wide margin.
 
 ## Numbers
 
