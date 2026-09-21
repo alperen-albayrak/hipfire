@@ -55,6 +55,44 @@ not load-tested. So these numbers may have headroom.
 `Maximum concurrency for 131,072 tokens per request: 1.00x`, 31.2 of 31.9 GiB
 resident. Two concurrent 128K lanes need a shorter per-request context.
 
+### 250K does not fit on radiance — tested 2026-09-21
+
+`MAXLEN=262144` fails at engine init:
+
+> To serve at least one request with the model's max seq len (262144), 8.82 GiB
+> KV cache is needed, which is larger than the available KV cache memory
+> (**4.84 GiB**)
+
+`MAXLEN=143360` also fails (needs 5.2 GiB). `131072` works. **The practical
+ceiling is ~133K.**
+
+The binding constraint is the checkpoint, not the engine:
+
+| | GiB |
+|---|---:|
+| MXFP4 checkpoint | 19 |
+| DFlash2 drafter | 2 |
+| activations + CUDA graphs | ~5 |
+| **KV remaining** | **4.84** |
+| KV needed @262,144 (fp8, 33.6 KB/token) | **8.82** |
+
+ParoQuant does not help: `z-lab/Qwen3.8-27B-PARO` is "4.25 bits/weight, the same
+as MXFP4". Dropping the drafter frees ~2 GiB (~203K) but costs most of the
+decode advantage.
+
+### The three-way trade, complete
+
+| engine | prefill / decode @128K | context ceiling |
+|---|---|---:|
+| **radiance/vLLM** | **2,280 / ~55 t/s** | ~133K (VRAM) |
+| **llama.cpp** | 760 / 15.1 t/s | ~130K (issue 27756) |
+| **hipfire** | 101 / 7.8 t/s | **165K measured, 262K configured** |
+
+**No engine on this card delivers both speed and 250K.** hipfire reaches further
+for exactly the reason measured earlier: fwht3 K costs 23.8 KB/token against
+radiance's 33.6 KB/token fp8 — 5.8 GiB vs 8.8 GiB at 250K. The fwht3 decision
+buys context reach, and costs 22x the prefill time to use it.
+
 **This revises the earlier "vLLM is out" conclusion in this document.** Upstream
 vLLM builds for gfx1201 but ships CDNA-only AITER kernels; this fork supplies
 the RDNA4 work upstream lacks, and the result is the fastest of the three by a
