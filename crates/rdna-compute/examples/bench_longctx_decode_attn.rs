@@ -97,88 +97,109 @@ fn main() {
     );
     eprintln!();
     println!(
-        "{:>9}  {:>10}  {:>9}  {:>9}  {:>8}",
-        "seq_len", "max_seq", "ms/call", "GB/s", "arm"
+        "{:>9}  {:>6}  {:>6}  {:>9}  {:>9}  {:>11}",
+        "seq_len", "batch", "tier", "ms/call", "GB/s", "us/token"
     );
 
-    let q_elems = BATCH * N_HEADS * HEAD_DIM;
-    let out_elems = BATCH * N_HEADS * HEAD_DIM;
     // FWHT-256 sign tables, as the fwht3 K-write used.
     let signs1 = gpu.upload_f32(&vec![1.0f32; 256], &[256]).unwrap();
     let signs2 = gpu.upload_f32(&vec![1.0f32; 256], &[256]).unwrap();
 
-    for seq_len in [4096usize, 16_384, 32_768, 65_536, 124_345] {
-        // Two arms at the same seq_len: production allocation vs one sized to
-        // the request. Only `max_seq` differs, so any gap is candidate B.
-        for (arm, max_seq) in [("prod", PROD_MAX_SEQ), ("tight", seq_len.next_multiple_of(256))] {
-            if max_seq < seq_len {
-                continue;
-            }
-            let k_bytes = max_seq * N_KV_HEADS * k_bytes_per_head();
-            let v_bytes = max_seq * N_KV_HEADS * v_bytes_per_head();
-            let k_cache = gpu.zeros(&[k_bytes.div_ceil(4)], DType::F32).unwrap();
-            let v_cache = gpu.zeros(&[v_bytes.div_ceil(4)], DType::F32).unwrap();
-            let q = gpu.upload_f32(&lcg(0xa5, q_elems), &[q_elems]).unwrap();
-            let out = gpu.zeros(&[out_elems], DType::F32).unwrap();
+    // ── Experiment 1: does the kernel care about BYTES? ────────────────
+    // fwht3 K is 400 B/pos, Q8 K is 1088 B/pos — 1.46x more total KV bytes
+    // for identical work. If this kernel is bandwidth-bound, Q8 must be
+    // ~1.46x slower. If the two take the SAME time, bytes are not the
+    // limiter and fwht3's compression buys nothing here.
+    //
+    // ── Experiment 2: is it starved at the verify batch? ────────────────
+    // The DFlash verify batch is 8. The tuned gfx1201 FA2 kernel requires
+    // batch_size in 64..=512 — so if per-token cost falls sharply as batch
+    // grows, the decode path is occupancy-starved at exactly the batch it
+    // always runs at, and that is the same wall FA2's floor describes.
+    let max_seq = PROD_MAX_SEQ;
+    let k_bytes = max_seq * N_KV_HEADS * k_bytes_per_head();
+    let v_bytes = max_seq * N_KV_HEADS * v_bytes_per_head();
+    // Q8 K is 272 B/head, the same layout V already uses.
+    let k8_bytes = max_seq * N_KV_HEADS * v_bytes_per_head();
+    let k_cache = gpu.zeros(&[k_bytes.div_ceil(4)], DType::F32).unwrap();
+    let k8_cache = gpu.zeros(&[k8_bytes.div_ceil(4)], DType::F32).unwrap();
+    let v_cache = gpu.zeros(&[v_bytes.div_ceil(4)], DType::F32).unwrap();
 
-            // Every verify row sits at the end of the context, as a real
-            // decode step does.
-            let pos: Vec<i32> = (0..BATCH).map(|i| (seq_len - BATCH + i) as i32).collect();
-            let positions = gpu.upload_f32(&vec![0.0f32; BATCH], &[BATCH]).unwrap();
+    let tile = rdna_compute::attention::q8_flash_tile_size(
+        &gpu.arch, N_HEADS, N_KV_HEADS, HEAD_DIM, max_seq,
+    );
+    let partials_len = N_HEADS * max_seq.div_ceil(tile) * (2 + HEAD_DIM);
+    eprintln!(
+        "  flash tile={tile}, partials tiles={}",
+        max_seq.div_ceil(tile)
+    );
+    eprintln!();
+
+    for seq_len in [32_768usize, 124_345] {
+        for batch in [8usize, 16, 32, 64, 128] {
+            let q_elems = batch * N_HEADS * HEAD_DIM;
+            let q = gpu.upload_f32(&lcg(0xa5, q_elems), &[q_elems]).unwrap();
+            let out = gpu.zeros(&[q_elems], DType::F32).unwrap();
+            let pos: Vec<i32> = (0..batch).map(|i| (seq_len - batch + i) as i32).collect();
+            let positions = gpu.upload_f32(&vec![0.0f32; batch], &[batch]).unwrap();
             let pb: Vec<u8> = pos.iter().flat_map(|v| v.to_ne_bytes()).collect();
             gpu.hip.memcpy_htod(&positions.buf, &pb).unwrap();
-
-            let tile = rdna_compute::attention::q8_flash_tile_size(
-                &gpu.arch, N_HEADS, N_KV_HEADS, HEAD_DIM, max_seq,
-            );
-            let partials_len = N_HEADS * max_seq.div_ceil(tile) * (2 + HEAD_DIM);
-            let partials = gpu.zeros(&[partials_len], DType::F32).unwrap();
-
-            let call = |gpu: &mut Gpu| {
-                gpu.attention_flash_fwht3_batched_masked(
-                    &q,
-                    &k_cache,
-                    &v_cache,
-                    &out,
-                    &positions,
-                    &signs1,
-                    &signs2,
-                    N_HEADS,
-                    N_KV_HEADS,
-                    HEAD_DIM,
-                    max_seq,
-                    seq_len,
-                    BATCH,
-                    &partials,
-                    None,
-                    0,
-                    0,
-                    8, // v_mode_bits: Q8_0 V
+            let partials = gpu
+                .zeros(
+                    &[partials_len.max(batch * N_HEADS * (2 + HEAD_DIM))],
+                    DType::F32,
                 )
-                .expect("decode attention");
-            };
+                .unwrap();
 
-            // Warm the JIT and any lazy allocation before timing.
-            call(&mut gpu);
-            gpu.hip.device_synchronize().unwrap();
+            for tier in ["fwht3", "q8"] {
+                let run = |gpu: &mut Gpu| {
+                    if tier == "fwht3" {
+                        gpu.attention_flash_fwht3_batched_masked(
+                            &q, &k_cache, &v_cache, &out, &positions, &signs1, &signs2, N_HEADS,
+                            N_KV_HEADS, HEAD_DIM, max_seq, seq_len, batch, &partials, None, 0, 0,
+                            8,
+                        )
+                        .expect("fwht3 decode attention");
+                    } else {
+                        gpu.attention_flash_q8_0_batched_masked(
+                            &q, &k8_cache, &v_cache, &out, &positions, N_HEADS, N_KV_HEADS,
+                            HEAD_DIM, max_seq, seq_len, batch, &partials, None, 0, 0,
+                        )
+                        .expect("q8 decode attention");
+                    }
+                };
+                run(&mut gpu);
+                gpu.hip.device_synchronize().unwrap();
+                let t0 = std::time::Instant::now();
+                for _ in 0..iters {
+                    run(&mut gpu);
+                }
+                gpu.hip.device_synchronize().unwrap();
+                let ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
 
-            let t0 = std::time::Instant::now();
-            for _ in 0..iters {
-                call(&mut gpu);
+                let per_head = if tier == "fwht3" {
+                    k_bytes_per_head()
+                } else {
+                    v_bytes_per_head()
+                };
+                let bytes = seq_len * N_KV_HEADS * (per_head + v_bytes_per_head());
+                let gbs = bytes as f64 / (ms / 1000.0) / 1e9;
+                // Per-token cost is what decode actually pays: one verify step
+                // serves `batch` draft slots.
+                let us_per_tok = ms * 1000.0 / batch as f64;
+                println!(
+                    "{seq_len:>9}  {batch:>6}  {tier:>6}  {ms:>9.3}  {gbs:>9.1}  {us_per_tok:>11.1}"
+                );
             }
-            gpu.hip.device_synchronize().unwrap();
-            let ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
-
-            // One layer reads the whole KV span once.
-            let bytes = seq_len * N_KV_HEADS * (k_bytes_per_head() + v_bytes_per_head());
-            let gbs = bytes as f64 / (ms / 1000.0) / 1e9;
-            println!("{seq_len:>9}  {max_seq:>10}  {ms:>9.3}  {gbs:>9.1}  {arm:>8}");
         }
     }
 
     eprintln!();
     eprintln!("Reading this: R9700 roofline is ~640-700 GB/s (the short-context");
-    eprintln!("decode path measures ~660). A flat low GB/s across seq_len points");
-    eprintln!("at candidate A (alignment); a prod-vs-tight gap points at B");
-    eprintln!("(partials sized by max_seq). Both can be true.");
+    eprintln!("decode path measures ~660).");
+    eprintln!("  * q8 ~1.46x slower than fwht3  => bandwidth-bound by bytes.");
+    eprintln!("  * q8 ~= fwht3                  => bytes are NOT the limiter;");
+    eprintln!("    fwht3 compression buys nothing inside this kernel.");
+    eprintln!("  * us/token falling sharply with batch => occupancy-starved at");
+    eprintln!("    the verify batch of 8, the same wall FA2 64..=512 describes.");
 }
