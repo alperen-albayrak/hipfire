@@ -16,7 +16,9 @@ so the 760M iGPU could take no layers — re-running pinned changed nothing
 
 | | llama.cpp | hipfire | ratio |
 |---|---:|---:|---|
-| prefill @124K | **563.5 tok/s** | 101.2 tok/s | **5.6x** |
+| **cold prefill @124K** | **760.1 tok/s** | 101.2 tok/s | **7.5x** |
+| **wall clock, same 124K prompt** | **168 s** (incl. model load) | 1,229 s | **7.3x** |
+| prefill @124K, marginal | **563.5 tok/s** | 43.6 tok/s (@~145K) | ~13x |
 | decode @124K, unspeculated | **15.49 tok/s** | ~3.84 tok/s | **4.0x** |
 | decode @124K, hipfire *with* DFlash2 | 15.49 | 7.8 tok/s | 2.0x |
 | prefill, short ctx | 1187.3 (pp2048) | 920 (4K) | 1.3x |
@@ -45,6 +47,11 @@ accountings agree.
   + Q8 V, DFlash2 on. 124,345-token prompt from the wikitext2 slice via
   `/v1/chat/completions`; `prefill_tok_s` / `decode_tok_s` / `tau` read from the
   response `timings`. tau was 2.03, so the unspeculated rate is 7.8 / 2.03.
+- **llama.cpp cold prefill**: `llama-cli -f <the same 124K prompt file hipfire
+  used> -n 16 -c 131072 -fa on -ctk q8_0 -ctv q8_0 -st --temp 0`, device 0 only.
+  Reported `Prompt: 760.1 t/s | Generation: 15.1 t/s`, 168 s total wall
+  including model load. The 15.1 t/s cross-checks llama-bench's 15.49 from a
+  different code path.
 - **llama.cpp**: build `ggml-org/llama.cpp` @ HEAD, HIP, `-DAMDGPU_TARGETS=gfx1201`.
   `llama-bench -fa on -ctk q8_0 -ctv q8_0 -p 2048 -n 64 -d 0,124000 -r 1`
   against `unsloth/Qwen3.8-27B-GGUF :: Qwen3.8-27B-UD-Q4_K_XL.gguf` (16.34 GiB).
@@ -107,6 +114,37 @@ Two further limits, both in-tree:
 - **llama.cpp**: RDNA4 is first-class (`GGML_CUDA_CC_RDNA4`, included in the
   MMA-capability predicates at `common.cuh:328,357`), and `LLM_ARCH_QWEN35`
   loaded and ran this checkpoint family without modification.
+
+## The MTP head — the biggest single lever, and hipfire's file cannot reach it
+
+Qwen3.8 ships a native MTP (NextN) head. It is present in the Unsloth GGUF —
+`blk.64.nextn.{eh_proj,enorm,hnorm,shared_head_norm}.weight`, layer 64 past the
+64 trunk layers, matching `mtp_num_hidden_layers: 1` in the checkpoint header.
+
+**`qwen3.8-27b.mq4` carries the config keys but none of the tensors** — they
+were dropped at quantization. hipfire supports MTP (`mtp_head.rs`, 2,616 lines;
+`speculation.mtp` defaults to `"auto"`; loads a `.mtp` file built by
+`mtp_extract.rs`), but with no `.mtp` file it silently falls through to DFlash.
+
+Independent measurement on this same card (akougkas.io, 2026, ROCm 7.2.4,
+131k ctx, 4 slots) puts MTP well ahead of DFlash2:
+
+| drafter | decode | acceptance |
+|---|---:|---:|
+| none | 27.1 t/s | — |
+| **MTP draft 2** | **46.2 t/s** | **66%** |
+| DFlash2 (Q8_0, n=5) | 36.8 t/s | 37% |
+
+Their production preset reaches **47.5 t/s single-stream at 131,072 context**
+with 67% acceptance and 892 t/s prefill in 27.5 GiB — against hipfire's 7.8 t/s
+and 101 t/s here. They also independently confirm two of our findings: KV type
+is "purely a trade of memory for quality" (q4_0/q8_0/f16 within noise on speed),
+and IQ4_NL reaches **487 GB/s, 76% of the card's 640 GB/s** — against hipfire's
+~78 GB/s at long context.
+
+**Caveat on context reach:** they cite llama.cpp issue 27756 — this hybrid emits
+an instant EOS beyond ~130k positions on every backend, capping usable context
+there. hipfire handled 165,282 tokens without trouble, just slowly.
 
 ## What hipfire still has that llama.cpp does not
 
