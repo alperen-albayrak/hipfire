@@ -151,7 +151,19 @@ fn main() {
                 )
                 .unwrap();
 
-            for tier in ["fwht3", "q8"] {
+            // "fa2" is the tuned gfx1201 GQA-fused kernel the production
+            // dispatch refuses here (it predicates batch_size 64..=512). The
+            // LAUNCHER has no such floor — only max_ctx_len <= 32768 — so it
+            // can be called directly to find out what that predicate costs.
+            // Its grid is [ceil(batch/8), 4, 1], so batch 8 yields FOUR
+            // workgroups: expect KV reuse but poor occupancy, and let the
+            // measurement decide which dominates.
+            let tiers: &[&str] = if seq_len <= 32_768 {
+                &["fwht3", "q8", "fa2"]
+            } else {
+                &["fwht3", "q8"]
+            };
+            for &tier in tiers {
                 let run = |gpu: &mut Gpu| {
                     if tier == "fwht3" {
                         gpu.attention_flash_fwht3_batched_masked(
@@ -200,6 +212,8 @@ fn main() {
     eprintln!("  * q8 ~1.46x slower than fwht3  => bandwidth-bound by bytes.");
     eprintln!("  * q8 ~= fwht3                  => bytes are NOT the limiter;");
     eprintln!("    fwht3 compression buys nothing inside this kernel.");
-    eprintln!("  * us/token falling sharply with batch => occupancy-starved at");
-    eprintln!("    the verify batch of 8, the same wall FA2 64..=512 describes.");
+    eprintln!("  * us/token flat in batch => the kernel re-reads the whole KV");
+    eprintln!("    per query row; no reuse across the verify batch.");
+    eprintln!("  * fa2 at batch 8: if it beats fwht3, the 64..=512 dispatch");
+    eprintln!("    predicate is leaving a large decode win on the floor.");
 }
