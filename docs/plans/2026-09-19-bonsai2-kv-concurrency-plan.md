@@ -1,21 +1,43 @@
-# Bonsai 2 27B, the KV tier, and two-lane concurrency on R9700
+# The KV tier and two-lane concurrency on R9700
+
+*(Originally "Bonsai 2 27B, the KV tier, and two-lane concurrency" — the
+Bonsai arm was withdrawn 2026-09-21; see the revision note below.)*
 
 **Goal:** Serve two independent 262K-token conversations concurrently on a
-single 32 GB R9700 (gfx1201), keeping the fwht3 K tier. Today neither half is
-possible: the model is too big for two full-context lanes, and the multi-slot
-path is hard-wired to Q8 KV.
+single 32 GB R9700 (gfx1201), on `qwen3.8-27b.mq4`, keeping the fwht3 K tier.
+The blocker is the multi-slot KV path being hard-wired to Q8: at Q8 two
+full-context lanes do not fit in 32 GB, and at fwht3 they do.
 
-**Architecture:** Three independent levers that compound, in dependency order —
-(1) establish what the fwht3 K tier actually costs against Q8, because
-everything below is justified by that number; (2) port PrismML's Bonsai 2 27B,
-which is Qwen3.8-27B in a Hadamard-rotated ternary basis, reusing the existing
-`TQ2G128` kernels through a rotated sibling dtype; (3) teach the multi-slot KV
-path the asym3 tier, which already has its attention kernel and needs its write
-and prefill kernels.
+**Architecture:** Two levers — (1) establish what the fwht3 K tier actually
+costs against Q8, because everything else is justified by that number;
+(2) teach the multi-slot KV path the asym3 tier, which already has its
+attention kernel and needs its write and prefill kernels.
 
-**Tech Stack:** Rust (`hipfire-quantize`, `hipfire-dispatch`,
-`hipfire-arch-qwen35`, `rdna-compute`, `hipfire-daemon`). Two new HIP kernels
-(Task 5, Task 6); everything else reuses kernels already in tree.
+**Tech Stack:** Rust (`hipfire-dispatch`, `hipfire-arch-qwen35`,
+`rdna-compute`, `hipfire-daemon`). Two new HIP kernels (Tasks 5, 6);
+everything else reuses kernels already in tree.
+
+### REVISION 2026-09-21: the Bonsai 2 arm is WITHDRAWN
+
+Tasks 1, 2 and 3 are dropped. The user evaluated Ternary Bonsai 2 27B directly
+and found it **worse than `qwen3.8-27b` MQ4V2**. Task 2 was exactly this gate,
+and it was answered empirically before any porting work started — which is the
+outcome the gate existed to produce.
+
+The consequence is smaller than it looks. Bonsai 2 was a means to free VRAM for
+a second lane; with the numbers now measured rather than estimated, **the
+second lane is decided by the KV tier, not by model size** — see the two-lane
+table below. Dropping Bonsai does not kill the goal; it makes Tasks 4-6 the
+thing that decides it.
+
+### CORRECTION 2026-09-21: hipfire already has paged KV
+
+An earlier revision of this plan stated that hipfire allocates KV upfront for
+`max_seq`, and a session discussion built on that to claim paged KV was a gap
+against vLLM / SGLang / llama.cpp / Splash. **Both were wrong**, from reading
+only the `contiguous` allocator. `memory.kv_backend = "vmm"` reserves the
+logical window and commits pages on demand, and it is the registry default for
+`qwen3.8:27b`. See the backend note under "KV cost per token".
 
 **Hardware envelope:** gfx1201 (Radeon AI PRO R9700, 32 GB), single card. Every
 number in this plan is for that envelope and does not generalise.
@@ -43,8 +65,20 @@ KV bytes = max_seq × n_full_attention_layers × (k_bytes_per_pos + v_bytes_per_
 Two properties of that allocator matter for sizing and were confirmed by code
 read, not assumed:
 
-- It allocates **upfront for `max_seq`** (`physical_cap`), not grown per token.
-  A conversation's KV footprint is fixed at load, by configuration.
+- **Which backend allocates matters.** `memory.kv_backend` selects it
+  (`crates/hipfire-runtime/src/kv_backend.rs`, types in
+  `crates/saddle-core/src/kv.rs`):
+  - `contiguous` — the `new_gpu_*` constructors above, allocating
+    `physical_cap × bytes_per_pos` **upfront** with no grow path.
+  - `vmm` — "reserves the logical context window and commits physical pages
+    on demand" (`hipfire-config/src/lib.rs:898`), via `KvChunkPlan`
+    (reserve/growth bytes, page-aligned, asym3 and q8 both handled).
+
+  **`vmm` is the registry default for `qwen3.8:27b`**, together with
+  `max_seq = 262144` and `generation.max_tokens = 81920`
+  (`crates/hipfire-cli/src/main.rs:7185`). So a 262K lane RESERVES 262K and
+  COMMITS what it uses. Full-commit figures below are worst case, not
+  what a typical conversation costs.
 - It allocates **only for full-attention layers**. The `*_filtered`
   constructors take an `is_kv_layer` mask, built at
   `crates/hipfire-arch-qwen35/src/speculative.rs:896` as
@@ -61,10 +95,13 @@ At Qwen3.8-27B geometry (H24 / KV4 / head_dim 256):
 | **asym3 / fwht3** | **400** | **+1088** | **23.3 KiB** | **6.2 GB** |
 | asym2 / fwht2 | 272 | +1088 | 21.3 KiB | 5.6 GB |
 
-**The 16-layer count is NOT verified.** It comes from PrismML's "~75% linear /
-~25% full" against 64 layers. Read it from the checkpoint's `config.json`
-before sizing anything on it — every absolute figure in this plan scales
-linearly with it.
+**The 16-layer count is CONFIRMED** (2026-09-21, from the `qwen3.8-27b.mq4`
+header on cachy-01): `num_hidden_layers: 64` with `layer_types` an exact
+`[linear, linear, linear, full] x 16` pattern and `full_attention_interval: 4`
+— so 16 full-attention layers. Also confirmed there: `head_dim: 256`,
+`num_attention_heads: 24`, `num_key_value_heads: 4`,
+`max_position_embeddings: 262144`, `hidden_size: 5120`. Every capacity figure
+in this plan rests on these and they are now read, not inferred.
 
 ### What is robust, and what is not
 
@@ -80,39 +117,39 @@ Both the full-attention layer count and `max_seq` cancel. "Q8 costs ~1.46×
 fwht3" holds whatever those turn out to be, and it is the number the asym3
 slot-kernel work (Tasks 4–6) is justified by.
 
-**The absolute pair (18.3 GB vs 12.5 GB for two 262K lanes) is an estimate**
-that scales with the layer count above. If the true count is 12, the pair
-becomes 13.7 / 9.4 GB — same ratio, different budget. Treat the absolutes as
-the shape of the problem, not as numbers to plan VRAM against, until the
-baseline row below is filled in.
+**The absolutes are now measured too** (2026-09-21), so the earlier caveat is
+discharged: the layer count is read from the checkpoint, the model and card
+sizes from the box. Two full-commit 262K lanes are 11.63 GiB at fwht3 and
+17.00 GiB at Q8. Under `vmm` these are ceilings, not running costs.
 
 V at Q8 (1088 B) dominates once K drops below it, which is why fwht2 buys so
 little over fwht3 and why the V-quant ladder (lloyd4/3/2) exists separately.
 
-### Measured baseline on cachy-01 — TO BE FILLED
+### Measured baseline on cachy-01 — 2026-09-21
 
-Everything above is arithmetic. This row anchors it to the running system, and
-should be recorded before any capacity decision:
+| field | value | source |
+|---|---|---|
+| model + quant | `qwen3.8-27b.mq4` (MQ4V2) | `models.toml` |
+| model bytes on disk | 14.59 GiB | `ls` |
+| drafter / vision sidecar | 1.13 / 0.86 GiB | `ls` |
+| `max_seq` | **262144** (registry default, not set in `config.toml`) | `main.rs:7185` |
+| `kv_backend` | **vmm** (registry default) | `main.rs:7185` |
+| `kv_cache` tier | fwht3 | `config.toml`, `models.toml` override |
+| full-attention layers | **16** of 64 | model header |
+| KV at full commit, fwht3 | 5.81 GiB | formula above |
+| VRAM total | 31.86 GiB | `rocm-smi` |
+| VRAM high-water, 1 conversation | ~27 GiB (observed, unquantified) | user report |
 
-| field | value |
-|---|---|
-| model + quant | qwen3.8-27b MQ4V2 |
-| model bytes on disk | — |
-| `max_seq` configured | — |
-| full-attention layer count (from `config.json`) | — |
-| KV bytes by the formula above | — |
-| VRAM high-water mark, 1 conversation | **~27 GB of 32** (observed, unquantified) |
+**Still unquantified:** activation and prefill scratch. Backing it out of the
+~27 GiB observation gives roughly 4-5 GiB, which is the number the two-lane
+margin is sensitive to. Worth measuring properly rather than inferring.
 
-**The observation is already load-bearing, independent of the layer count.** At
-~27 GB with a ~14 GB model, KV plus everything else is ~13 GB **for one lane**.
-A second lane at the same context does not fit — it would want ~40 GB.
-Replacing a 14 GB model with Bonsai 2's 5.9 GB frees ~8 GB, taking headroom
-from ~5 GB to ~13 GB and roughly **doubling the KV budget at the same context
-setting**.
-
-That is the two-lane argument made from a measurement rather than from the
-estimate tables, and it does not depend on the unverified layer count. It is
-the strongest form of the case this plan rests on.
+**Superseded by the measured table above** (2026-09-21). The earlier reading
+of the ~27 GiB observation — that a second lane "would want ~40 GB" and so
+needed a smaller model — assumed contiguous allocation and an unmeasured model
+size. With `vmm` reserving rather than committing, and the fixed footprint now
+measured at 16.58 GiB, two fwht3 lanes fit at 28.2 GiB worst case. The model
+does not need to shrink; the KV tier needs to reach the slot path.
 
 ### Quality ladder
 
@@ -131,27 +168,42 @@ is the knee, which is why it is the production choice.
 **That campaign has no q8-K row.** The ladder is calibrated against itself, not
 against the tier above it. Task 0 exists to close this.
 
-### Model footprint
+### Fixed footprint — MEASURED on cachy-01, 2026-09-21
 
-| model | bpw | size | source |
-|---|---:|---:|---|
-| qwen3.8-27b MQ4V2 | — | ~14 GB | estimate, not measured |
-| Bonsai 2 PQ2_0 | 2.16 | 7.25 GB | PrismML docs |
-| Bonsai 2 PTQ1_0 | 1.76 shipped / 1.72 true | 5.93 GB | PrismML docs |
+`ls` on `~/.hipfire/models/`, and `rocm-smi` for the card:
 
-### Two 262K lanes against 32 GB
+| | GiB |
+|---|---:|
+| `qwen3.8-27b.mq4` | 14.59 |
+| `qwen38-27b-dflash-mq4.hfq` (drafter) | 1.13 |
+| `qwen3.8-27b-vision.hfq` (sidecar) | 0.86 |
+| **fixed total** | **16.58** |
+| VRAM total (34,208,743,424 B) | 31.86 |
+| **available for KV + scratch** | **15.28** |
 
-| model | KV ×2 @ Q8 | KV ×2 @ fwht3 |
+### Two 262K lanes against 32 GB — the decision
+
+Worst case, both lanes fully committed to 262,144 tokens across 16
+full-attention layers. With `vmm` each lane commits only what it uses, so this
+is a ceiling, not a running cost.
+
+| KV tier | one lane | two lanes |
 |---|---:|---:|
-| MQ4V2 (~14 GB) | 32.3 GB ✗ | 26.5 GB — no headroom |
-| Bonsai 2 PQ2_0 (7.25) | 25.6 GB — tight | **19.7 GB** |
-| Bonsai 2 PTQ1_0 (5.93) | 24.2 GB | **18.3 GB** |
+| **fwht3** (23,808 B/tok) | 5.81 → **22.4 GiB** ✓ | 11.63 → **28.2 GiB**, ~3.6 GiB margin |
+| Q8 (34,816 B/tok) | 8.50 → 25.1 GiB ✓ | 17.00 → **33.6 GiB** ✗ |
 
-Excludes DeltaNet state, activation and prefill scratch, the DFlash drafter,
-and the vision sidecar. Real headroom is thinner than these totals. The point
-of the table is the ordering, not the absolute numbers: **the small model is
-what makes two lanes possible, and the fwht3 tier is what makes them
-comfortable.**
+**This is the whole case for Tasks 4-6.** Two full-context lanes fit at fwht3
+and do not fit at Q8, and continuous batching is Q8-only today. The KV tier is
+the binding constraint — not model size, which is why withdrawing Bonsai 2
+does not withdraw the goal.
+
+**One lane is already available** and needs no work from this plan: `max_seq`
+is 262144 by default for this model and one fwht3 lane leaves ~9.5 GiB spare.
+
+The 3.6 GiB two-lane margin excludes activation and prefill scratch, which is
+unmeasured — the ~27 GiB observation below implies roughly 4-5 GiB, which would
+make the full-commit case marginal. Under `vmm` that matters only if both lanes
+actually reach 262K.
 
 ---
 
@@ -295,7 +347,15 @@ justified by an unmeasured assumption.
 
 ---
 
-## Task 1: PQ2_0 ingest as a rotated ternary sibling
+## Task 1: PQ2_0 ingest as a rotated ternary sibling — WITHDRAWN 2026-09-21
+
+**Not being done.** Ternary Bonsai 2 27B was evaluated directly and is
+worse than `qwen3.8-27b` MQ4V2. Kept below for the record: the Hadamard /
+rotated-sibling analysis stays accurate and is the starting point if any
+future rotated-basis checkpoint needs ingesting.
+
+<details>
+<summary>Original task text</summary>
 
 **Goal:** Load Bonsai 2 at 7.25 GB with zero new kernels.
 
@@ -330,9 +390,19 @@ size or sign mismatch produces fluent wrong text, not an error.
 **Done when:** `hipfire-quantize` produces a `.hfq` from the PQ2_0 GGUF, it
 loads, and it generates coherent text on the 5-genre serve battery.
 
+</details>
+
 ---
 
-## Task 2: is Bonsai 2 actually good? (GATE)
+## Task 2: is Bonsai 2 actually good? (GATE) — WITHDRAWN 2026-09-21
+
+**Not being done.** Ternary Bonsai 2 27B was evaluated directly and is
+worse than `qwen3.8-27b` MQ4V2. Kept below for the record: the Hadamard /
+rotated-sibling analysis stays accurate and is the starting point if any
+future rotated-basis checkpoint needs ingesting.
+
+<details>
+<summary>Original task text</summary>
 
 **Goal:** Decide whether anything below is worth building.
 
@@ -357,9 +427,19 @@ recorded in the fixture, and there is a written go/no-go.
 **Risk if skipped:** building Task 3's unpack kernel and three slot kernels for
 a model that is not good enough to serve.
 
+</details>
+
 ---
 
-## Task 3: PTQ1_0 dense trit unpack
+## Task 3: PTQ1_0 dense trit unpack — WITHDRAWN 2026-09-21
+
+**Not being done.** Ternary Bonsai 2 27B was evaluated directly and is
+worse than `qwen3.8-27b` MQ4V2. Kept below for the record: the Hadamard /
+rotated-sibling analysis stays accurate and is the starting point if any
+future rotated-basis checkpoint needs ingesting.
+
+<details>
+<summary>Original task text</summary>
 
 **Goal:** 5.93 GB instead of 7.25 GB — the 1.35 GB that turns "tight" into
 "comfortable" in the two-lane table.
@@ -380,6 +460,8 @@ scales, same GEMM. Only the decode differs.
 checkpoint within the batched-vs-per-token float tolerance (~7.5e-3, per
 `test_spec_rope_phase_bias_parity`'s finding). The two packings encode the same
 weights; a larger divergence means the unpack is wrong.
+
+</details>
 
 ---
 
@@ -479,23 +561,24 @@ direction.
 ```
 Task 0 (measure fwht3 vs Q8)  ← BLOCKING: justifies Tasks 4-6
    │
-Task 1 (PQ2_0 ingest) ──► Task 2 (is it good?)  ← GATE: justifies everything
-                               │
-                               ├──► Task 3 (PTQ1_0, 1.35 GB)
-                               │
-                               └──► Task 4 (tier plumbing)
-                                       └──► Task 5 (KV write)   ← both required
-                                       └──► Task 6 (prefill)    ← both required
-                                               └──► Task 7 (two lanes)
+   └──► Task 4 (tier plumbing)
+           ├──► Task 5 (KV write)      ← both required
+           └──► Task 6 (prefill)       ← both required
+                   └──► Task 7 (two lanes)
+
+Tasks 1-3 (Bonsai 2) — WITHDRAWN 2026-09-21.
 ```
 
-Tasks 0 and 1 are independent and can run in parallel. Nothing after Task 2
-starts before its go/no-go.
+Task 0 is the only thing between here and the kernel work, needs no new code,
+and can decide against Tasks 4-6 entirely. Do it first.
 
-**PR boundaries:** Task 1+3 (the Bonsai port) and Tasks 4-6 (asym3 slots) are
-independent and separately reviewable. Task 0 and Task 2 are benchmark commits.
+**PR boundaries:** Task 0 is a benchmark commit. Tasks 4-6 are one reviewable
+arm. Task 7 is configuration plus a measurement.
 
----
+**What is already available and needs nothing from this plan:** a single 262K
+lane. `max_seq` is 262144 by default, `kv_backend` is `vmm`, and one fwht3 lane
+is 5.81 GiB against 15.28 GiB free. If two lanes turn out not to be worth the
+kernel work, the fallback is the status quo, not a regression.
 
 ## Validation
 
@@ -517,41 +600,48 @@ independent and separately reviewable. Task 0 and Task 2 are benchmark commits.
 
 ## Out of scope
 
-- **Vision.** Bonsai 2 ships its own mmproj (0.47B tower, HQQ-4bit 0.63 GB or
-  BF16 0.93 GB). Whether it drops into the existing VL sidecar path is a
-  separate question, and the VL plan is mid-flight.
-- **DFlash on Bonsai 2.** No draft model exists for it. Ternary decode
-  throughput is also unmeasured — it may not need one.
-- **`BQ1G128` / binary Bonsai 2.** No binary variant announced.
-- **More than 2 lanes.** The scheduler's fixture uses 4; this plan targets 2 at
+- **Bonsai 2 / ternary checkpoints.** Withdrawn — worse than MQ4V2 on this
+  workload. Tasks 1-3 kept collapsed for the record.
+- **Vision.** The VL plan is mid-flight; the sidecar's 0.86 GiB is counted in
+  the fixed footprint here and otherwise untouched.
+- **More than 2 lanes.** The scheduler fixture uses 4; this plan targets 2 at
   full native context, which is the harder constraint.
 - **`experimental_multi_slot`.** Explicitly not continuous batching; not a path
   to this goal.
+- **Porting Splash's engine design.** Its `StateCache` and scheduler are worth
+  reading (Apache-2.0, cloned at `../splash`), but adopting them is a separate
+  decision, not part of this plan. Recorded as open question 6.
 
 ---
 
 ## Open questions
 
-1. **PQ2_0's actual block layout.** 34 B/128 is arithmetic, not evidence.
-   Blocks Task 1.
-2. **The Hadamard contract** — block size, sign convention, normalisation.
-   Blocks Task 1, and gets no error if wrong.
-3. **Full-attention layer count** for Qwen3.8-27B. Every *absolute* capacity
-   number scales with it. The Q8/fwht3 ratio (1.4624) does not — see
-   "What is robust, and what is not".
-4. **The cachy-01 baseline row** — `max_seq`, model bytes, and the measured
-   VRAM high-water mark. Cheapest item here and it anchors everything else;
-   the ~27 GB observation is currently unquantified.
-5. **Whether asym3 prefill needs the WMMA sibling** to avoid trading a
+1. **Does fwht3 cost more than Q8 K by enough to matter?** Task 0. Unmeasured,
+   and it is what Tasks 4-6 are justified by. Everything else here is downstream.
+2. **Activation and prefill scratch footprint.** Unmeasured; backed out of the
+   ~27 GiB observation it is roughly 4-5 GiB. The two-lane margin at full
+   commit is ~3.6 GiB, so this number decides whether the worst case is
+   actually reachable.
+3. **Does the `vmm` backend reach the slot path?** The measured defaults apply
+   to the ordinary `LoadedModel` path. Whether `SlotPool`'s arenas are VMM-backed
+   or contiguous is unchecked, and it changes Task 7's budget from a ceiling
+   into a commitment.
+4. **Whether asym3 prefill needs the WMMA sibling** to avoid trading a
    capacity win for a latency loss (Task 6).
-6. **What actually binds first** in the two-lane budget — the estimate excludes
-   DeltaNet state, prefill scratch, and the drafter.
-7. **Long-context decode on gfx1201 is unmeasured.** The only long-context
-   decode data in tree is gfx1100 / qwen3.6 / fwht3 / no DFlash: 35.2 tok/s at
-   32,649 ctx
+5. **Long-context decode on gfx1201 is unmeasured.** The only data in tree is
+   gfx1100 / qwen3.6 / fwht3 / no DFlash: 35.2 tok/s at 32,649 ctx
    (`benchmarks/quality-baselines/results/2026-05-31-kv-vquant/longctx-decode-ab.txt`).
-   This plan sizes 262K lanes without knowing whether decode stays usable at
-   length. For scale, Inco's SPLASH reports 54 tok/s at 32K on Qwen3.8-27B on
-   M3+ Macs, against hipfire's ~140 tok/s at short context on gfx1201 — so the
-   short-context lead is large and the long-context behaviour is simply
-   unknown. Measure before committing to the context ceiling.
+   A 262K lane is not worth much if decode collapses at length. For scale,
+   Inco's Splash reports 54 tok/s at 32K on Qwen3.8-27B on M3+ Macs against
+   hipfire's ~140 tok/s at short context on gfx1201 — the short-context lead is
+   large and the long-context behaviour is simply unknown.
+6. **Recurrent-state reuse across prefix boundaries.** hipfire snapshots
+   DeltaNet state for session *swap* (`SlotSnapshot` carries `s_matrices`,
+   `s_scales`, `conv_states`, `s_ef_residual`), but there is no cache of
+   recurrent states keyed by KV block with deepest-prefix lookup. Splash's
+   `StateCache` (`runtime/engine/StateCache.hpp`, Apache-2.0) does exactly
+   that — target-recurrent **and** draft context attached to a KV block and
+   restored atomically, with `acquireDeepest(kvChain)`, leases, and disposable
+   checkpoints that evict before ordinary states. On a hybrid model this is
+   what separates "prefix reuse works" from "prefix reuse works until the
+   recurrent state disagrees". Shared with the VL plan's Task 5.
