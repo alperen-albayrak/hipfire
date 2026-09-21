@@ -1,8 +1,9 @@
 # Long-context: hipfire vs llama.cpp on one R9700 (gfx1201), 2026-09-21
 
-**One-line result: at 124K context llama.cpp is 5.6x faster at prefill and 4.0x
-faster at decode than hipfire, on the same GPU, in the same hour — while
-carrying a 12% larger model and reading 46% more KV.**
+**One-line result: at 124K context llama.cpp is 7.5x faster at cold prefill and
+4.0x faster at decode than hipfire, on the same GPU, in the same hour — while
+carrying a 12% larger model and reading 46% more KV.** The same 124K prompt
+that costs hipfire 20.5 minutes to first token costs llama.cpp 2.8.
 
 hipfire is *faster* at short context. It collapses at long context; llama.cpp
 degrades gently. That difference is the finding.
@@ -71,7 +72,7 @@ accountings agree.
   124K->165K. Comparing llama.cpp's marginal against hipfire's average
   understates the gap; marginal-vs-marginal is 563.5 vs 43.6.
 
-llama.cpp wins by 4-5.6x despite all of it.
+llama.cpp wins by 4-7.5x despite all of it.
 
 ## Why — corroborated by kernel isolation
 
