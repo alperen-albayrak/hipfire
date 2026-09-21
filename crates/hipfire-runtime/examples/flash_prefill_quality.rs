@@ -29,7 +29,7 @@
 //!
 //! Usage:
 //!   flash_prefill_quality <model.hfq> <corpus.txt> <out.bin>
-//!                         [--ctx N] [--chunks C] [--stride S]
+//!                         [--ctx N] [--chunks C] [--stride S] [--kv-mode q8|asym3]
 
 #[cfg(not(feature = "deltanet"))]
 fn main() {
@@ -49,7 +49,7 @@ fn main() {
     if args.len() < 4 {
         eprintln!(
             "Usage: flash_prefill_quality <model.hfq> <corpus.txt> <out.bin> \
-             [--ctx N] [--chunks C] [--stride S]"
+             [--ctx N] [--chunks C] [--stride S] [--kv-mode q8|asym3]"
         );
         std::process::exit(2);
     }
@@ -59,9 +59,24 @@ fn main() {
     let mut n_ctx: usize = 4096;
     let mut chunks: usize = 8;
     let mut stride: usize = 8;
+    let mut kv_mode = String::from("q8");
     let mut i = 4;
     while i < args.len() {
         match args[i].as_str() {
+            // Which K tier to score. The V tier stays Q8 in BOTH arms: this
+            // isolates one variable, and the 2026-05-31 campaign already swept
+            // V separately (lloyd4/3/2) against a fixed fwht3 K. Comparing
+            // q8-K/q8-V against asym3-K/q8-V is the missing top rung of that
+            // ladder — see docs/plans/2026-09-19-bonsai2-kv-concurrency-plan.md
+            // Task 0.
+            "--kv-mode" => {
+                kv_mode = args[i + 1].clone();
+                assert!(
+                    matches!(kv_mode.as_str(), "q8" | "asym3"),
+                    "--kv-mode must be q8 or asym3, got {kv_mode}"
+                );
+                i += 2;
+            }
             "--ctx" => {
                 n_ctx = args[i + 1].parse().unwrap();
                 i += 2;
@@ -112,13 +127,24 @@ fn main() {
     .expect("load weights");
 
     let kv_seq = (n_ctx + 16).max(512);
-    let mut kv_cache = KvCache::new_gpu_q8(
-        &mut gpu,
-        config.n_layers,
-        config.n_kv_heads,
-        config.head_dim,
-        kv_seq,
-    )
+    let mut kv_cache = match kv_mode.as_str() {
+        "asym3" => KvCache::new_gpu_asym3(
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_seq,
+        ),
+        // "q8" — the historical hardcoded behaviour, so an invocation with no
+        // --kv-mode scores byte-identically to every run before this flag.
+        _ => KvCache::new_gpu_q8(
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_seq,
+        ),
+    }
     .unwrap();
     // Allocated ONCE and reset in place per chunk: DeltaNetState has no Drop
     // impl, so per-chunk allocation leaks ~6 MB x n_la_layers.
