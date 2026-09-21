@@ -80,6 +80,50 @@ ParoQuant does not help: `z-lab/Qwen3.8-27B-PARO` is "4.25 bits/weight, the same
 as MXFP4". Dropping the drafter frees ~2 GiB (~203K) but costs most of the
 decode advantage.
 
+### radiance concurrency on one R9700 — measured 2026-09-21
+
+4,216-token prompt, ~200 tokens generated per request, end-to-end (prefill +
+decode), `MAXLEN=32768 MAXSEQS=16`, KV pool 84,192 tokens:
+
+| C | wall | tok/req | per-req t/s | **TOTAL t/s** |
+|---:|---:|---:|---:|---:|
+| 1 | 2.3 s | 224 | 95.9 | 95.9 |
+| 2 | 2.8 s | 201 | 75.2 | 142.9 |
+| **4** | 4.4 s | 228 | 56.7 | **209.5** (peak) |
+| 8 | 7.3 s | 183 | 30.2 | 201.4 |
+| 12 | 13.4 s | 204 | 23.3 | 181.7 |
+| 15 | 14.9 s | 188 | 19.9 | 189.4 |
+
+**The card compute-saturates at C=4.** Aggregate peaks at 209.5 t/s then
+flatlines (201 / 182 / 189 at C=8/12/15 — noise around a ceiling), while
+per-request falls monotonically 95.9 -> 19.9 t/s (4.8x). Past C=4 you buy
+queueing, not throughput.
+
+This independently reproduces the akougkas.io llama.cpp finding: "The GPU is
+already saturated by the batch. Speculation buys latency when the device is
+idle." Two engines, same conclusion about this card.
+
+### max_num_seqs is nearly free — the KV pool is shared, not partitioned
+
+Controlled A/B, identical `MAXLEN=32768`, only `max_num_seqs` differing:
+
+| `max_num_seqs` | KV pool | max concurrency @32K |
+|---:|---:|---:|
+| 2 | 85,627 tokens | 2.61x |
+| 16 | 84,192 tokens | 2.57x |
+
+**14 extra slots cost 1,435 tokens — 1.7% of the pool.** vLLM does not split KV
+per slot; it is one shared 64-token-paged pool, and a single request may occupy
+as much of it as `max_model_len` allows. Freed pages return for others to use.
+
+A hypothesis raised in session — that each slot reserves a large DeltaNet/SSM
+recurrent state on this hybrid model — is **refuted**: per-slot cost is ~3.7 MB
+equivalent, not ~75 MB. The earlier 136,548 -> 84,192 pool drop was driven by
+the `MAXLEN` change, not by `max_num_seqs`.
+
+Practical envelope on this card: **~4 concurrent turns at 4K, ~2 at 32K, 1 at
+128K.** Compute saturates at 4; memory saturates sooner as context grows.
+
 ### The three-way trade, complete
 
 | engine | prefill / decode @128K | context ceiling |
