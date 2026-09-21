@@ -358,6 +358,30 @@ For scale, every step *inside* the ladder is far smaller — fwht4→fwht3 was
 magnitudes are the point). The whole fwht ladder sits ~an order of magnitude
 below Q8, which is exactly what calibrating it against itself concealed.
 
+### Prefill speed: fwht3 is not slower (measured 2026-09-21)
+
+Same box and build. Wall-clock delta between a 4-chunk and a 12-chunk run, so
+the ~14.6 GiB model load and other fixed costs cancel; 8 chunks x 4095 = 32,760
+tokens of prefill in the difference; stride 2047 keeps the lm_head fan-out
+(identical in both arms) negligible.
+
+| rep | Q8 | fwht3 |
+|---|---:|---:|
+| 1 | 917 tok/s | 914 tok/s |
+| 2 | 923 tok/s | 913 tok/s |
+| **mean** | **920 tok/s** | **913 tok/s** |
+
+**fwht3 is ~0.7% slower.** Q8 won both reps, so the direction is consistent and
+the effect is real, but the magnitude is negligible.
+
+Mechanically this is the expected outcome: fwht3's extra ALU — dequantizing
+3-bit codes plus the signed FWHT-256 rotation of Q — is very nearly paid for by
+reading 2.7x less K (400 vs 1088 B/pos). The kernel is bandwidth-bound enough
+that the math rides along almost free.
+
+**So the fwht3 trade is ~1.6% quality and ~0.7% prefill speed, for 31.6% less
+KV.** Better than the plan assumed on the speed axis.
+
 ### What this does to Tasks 4-6
 
 They are no longer a free capacity win. The honest framing:
@@ -604,6 +628,55 @@ recorded.
 re-prefill**, not 2× throughput. For an agent workload that is the win that
 matters — and it is the same win as the VL prefix-reuse work, from the other
 direction.
+
+---
+
+## Task 8: the FA2 fast path stops at 32K context (found 2026-09-21)
+
+**Independent of the KV tier, and worth more than it for a 262K lane.**
+
+Both gfx1201 FA2 prefill arms are gated on
+`(64..=32768).contains(&io.max_ctx_len)`
+(`crates/hipfire-dispatch/src/families/attention.rs:1630` and `:1667`, enforced
+again in the launchers at `crates/rdna-compute/src/attention.rs:3574,3734`).
+**Past 32K, neither tier gets the tuned kernel** — the whole request falls back
+to the incumbent. Most of a 262K lane runs there.
+
+**The bound is real, but it belongs to the SPLIT path only.**
+`kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip:636`:
+
+> Key-range partition needs seq_len, which lives in `positions[]` on the host
+> side of the launcher... The body cannot know T yet, so approximate with a
+> fixed upper bound derived from the 32768 max_ctx_len gate:
+> T_MAX = 32768/64 = 512 tiles; per = ceil(512/S).
+
+With `per = (512 + n_splits - 1) / n_splits`, a context past 32768 leaves tiles
+beyond 512 assigned to no split — silently dropped KV, which is why the gate
+exists.
+
+**But the DIRECT kernel has no such limit.** It calls
+`fa2_gqa_body<false>(..., /*t0=*/0, /*t1=*/0x3fffffff, 0, 1)` — an unbounded
+tile range, with causal bounds coming from `positions[]`. The launcher applies
+32768 to both paths even though only one needs it.
+
+**Two ways out, in increasing order of work:**
+
+1. **Let the direct path serve `max_ctx_len > 32768`.** No kernel change —
+   a gate change. Gives up split-KV parallelism at long context but keeps the
+   tuned kernel instead of falling back entirely.
+2. **Pass the real tile count to the partial kernel.** It does not currently
+   take `max_ctx_len` at all (params end at `n_splits`), so this is a small
+   ABI addition plus its launcher, after which the split path works at any
+   context.
+
+**Do first:** measure what the >32K fallback actually costs. That sizes the win
+before anyone touches a gate, and it is the same measurement open question 5
+wants for long-context decode.
+
+**Done when:** prefill throughput above 32K is measured on both sides of the
+gate, and — if the win is real — the chosen option lands with the
+`test_batched_attn_slots`-style adversarial shape coverage the FA2 arms already
+expect.
 
 ---
 
