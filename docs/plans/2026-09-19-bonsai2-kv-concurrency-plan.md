@@ -8,10 +8,16 @@ single 32 GB R9700 (gfx1201), on `qwen3.8-27b.mq4`, keeping the fwht3 K tier.
 The blocker is the multi-slot KV path being hard-wired to Q8: at Q8 two
 full-context lanes do not fit in 32 GB, and at fwht3 they do.
 
-**Architecture:** Two levers — (1) establish what the fwht3 K tier actually
-costs against Q8, because everything else is justified by that number;
-(2) teach the multi-slot KV path the asym3 tier, which already has its
-attention kernel and needs its write and prefill kernels.
+**STATUS 2026-09-21: Task 0 has answered, and it narrowed the case.** fwht3
+costs **~1.6% perplexity** against Q8 K — an order of magnitude more than any
+step inside the fwht ladder. So Tasks 4-6 are not a free capacity win; they buy
+a second full-context lane at a measured quality cost. **This is now a product
+decision, not a technical one, and it should be made before the kernel work
+starts.** See Task 0.
+
+**Architecture:** One lever remains — teach the multi-slot KV path the asym3
+tier, which already has its attention kernel and needs its write and prefill
+kernels.
 
 **Tech Stack:** Rust (`hipfire-dispatch`, `hipfire-arch-qwen35`,
 `rdna-compute`, `hipfire-daemon`). Two new HIP kernels (Tasks 5, 6);
@@ -113,9 +119,13 @@ Separate the two, because they carry different confidence:
 2176 / 1488 = 1.4624
 ```
 
-Both the full-attention layer count and `max_seq` cancel. "Q8 costs ~1.46×
-fwht3" holds whatever those turn out to be, and it is the number the asym3
-slot-kernel work (Tasks 4–6) is justified by.
+Both the full-attention layer count and `max_seq` cancel. "Q8 costs ~1.46x
+fwht3" holds whatever those turn out to be. Stated from the other end, fwht3 is
+**31.6% smaller** than Q8 on total KV — and **63.2% smaller on K alone**, the
+difference being that V stays Q8 in both and is 73% of the fwht3 total.
+
+Task 0 now supplies the other half of the trade: that 31.6% costs ~1.6%
+perplexity.
 
 **The absolutes are now measured too** (2026-09-21), so the earlier caveat is
 discharged: the layer count is read from the checkpoint, the model and card
@@ -320,30 +330,71 @@ rotation is not replay-idempotent.
 
 ---
 
-## Task 0: measure fwht3 against Q8 K (BLOCKING, no new code)
+## Task 0: measure fwht3 against Q8 K — ANSWERED 2026-09-21
 
-**Goal:** The number this entire plan is justified by. Every task below trades
-quality for capacity on the assumption that fwht3's cost is small. Nobody has
-measured it.
+**Result: fwht3 K costs ~1.6% perplexity against Q8 K.**
 
-**Files:** none — `eval_hipfire` already does this.
+`flash_prefill_quality`, gfx1201, `qwen3.8-27b.mq4`,
+`benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt`, ctx 4096,
+stride 8, V pinned at Q8 in both arms so exactly one variable moves:
 
-**Do:** Run the same model and reference at `--kv-mode q8 --kv-v q8` and
-`--kv-mode asym3 --kv-v q8`, on gfx1201, `--scoring-mode prefill`. Add the q8-K
-row to the 2026-05-31 matrix so the ladder is calibrated against its top rung.
-Use qwen3.8-27b so the number applies to the model actually being served — the
-existing matrix is qwen3.6-27b on gfx1100.
+| chunks | scored | K tier | mean NLL | PPL | delta |
+|---:|---:|---|---:|---:|---|
+| 24 | 6144 | Q8 | 1.828699 | 6.2258 | — |
+| 24 | 6144 | **asym3** | 1.844946 | **6.3278** | **+0.0162 nats, +1.64%** |
+| 8 | 2048 | Q8 | 1.881532 | 6.5636 | — |
+| 8 | 2048 | asym3 | 1.902554 | 6.7030 | +0.0210 nats, +2.12% |
 
-**Done when:** a q8-K/q8-V KLD and PPL exist next to the fwht3 row, measured on
-gfx1201, committed under `benchmarks/quality-baselines/results/`.
+Both sample sizes agree in direction and magnitude; the 24-chunk figure is the
+one to quote. The gap is stable chunk-to-chunk rather than narrowing, so it is
+signal, not noise.
 
-**Decision it gates:** if fwht3's cost over Q8 is comparable to its cost over
-fwht4 (~0.0005 nats), Tasks 4–6 are clearly worth building. If it is large,
-the honest answer is to serve two lanes at Q8 with a smaller model and skip
-them — Bonsai 2 alone already fits that (24.2 GB).
+**This inverts the plan's premise.** The plan was written assuming fwht3 was
+approximately free and Q8 was a capacity tax paid for concurrency. Measured, it
+is the reverse: **Q8 is a ~1.6% quality upgrade that costs 1.46x the KV.**
 
-**Risk if skipped:** high, and of the worst kind — three tasks of kernel work
-justified by an unmeasured assumption.
+For scale, every step *inside* the ladder is far smaller — fwht4→fwht3 was
++0.0005 and fwht3→fwht2 +0.0039 (KLD against bf16, a different metric, but the
+magnitudes are the point). The whole fwht ladder sits ~an order of magnitude
+below Q8, which is exactly what calibrating it against itself concealed.
+
+### What this does to Tasks 4-6
+
+They are no longer a free capacity win. The honest framing:
+
+- **fwht3 in slots** (Tasks 4-6, two kernels): two full 262K lanes at 28.2 GiB,
+  at ~1.6% worse PPL than Q8.
+- **Q8, no kernel work**: better quality, continuous batching already works,
+  but two full lanes are 33.6 GiB and do not fit in 31.86 GiB.
+
+So the question Tasks 4-6 answer is "is a second full-context lane worth 1.6%
+perplexity and two kernels?" — not "how do we get free capacity". That is a
+narrower case than this plan was built on, and it is a product decision, not a
+technical one.
+
+Two observations that bear on it:
+
+- **The 1.6% is already being paid.** fwht3 is the production setting on
+  cachy-01 today. Switching to Q8 would recover it at no cost to anything
+  currently in use — `vmm` commits only what is touched, so the capacity fwht3
+  buys is unrealised unless conversations actually run long.
+- **V dominates, not K.** At 1088 B/pos, Q8 V is 73% of the fwht3 total. The
+  remaining capacity lever is the V ladder (lloyd4/3/2), already swept on
+  2026-05-31, not further K reduction.
+
+### Method note
+
+`eval_hipfire --kv-mode` could not be used: it requires a `--ref` from
+`build_kld_ref`, which needs a bf16 GGUF (~54 GB for 27B) and llama.cpp, and
+`flash_prefill_quality`'s own header records that this route "cannot run"
+because the reference builder sets `HIPFIRE_KV_MODE=f32`, which the config
+validator rejects. So the plan's "needs no new code" was wrong; the flag added
+in `925daa6d` is the change it actually needed.
+
+This measures NLL on wikitext, not KLD against a bf16 teacher. It is the right
+*comparison* (one variable, identical positions) but wikitext is not an agent
+or code workload — worth re-running on `benchmarks/prompts/` traffic before any
+irreversible decision.
 
 ---
 
