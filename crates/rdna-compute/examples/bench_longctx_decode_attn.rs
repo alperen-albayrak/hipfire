@@ -135,6 +135,48 @@ fn main() {
     );
     eprintln!();
 
+    // ── Experiment 3: does the tile kernel already share KV across the
+    // GQA group? ────────────────────────────────────────────────────────
+    // 24 q-heads over 4 kv-heads is gqa_ratio 6. If the kernel re-reads the
+    // KV per q-head, dropping to 4 q-heads (ratio 1) should cut time ~6x.
+    // If it already shares, time barely moves and the ONLY missing reuse is
+    // across the verify batch — which bounds the prize at ~8x, not ~48x.
+    {
+        let seq_len = 124_345usize;
+        let batch = 8usize;
+        for nh in [24usize, 12, 4] {
+            let q_elems = batch * nh * HEAD_DIM;
+            let q = gpu.upload_f32(&lcg(0xa5, q_elems), &[q_elems]).unwrap();
+            let out = gpu.zeros(&[q_elems], DType::F32).unwrap();
+            let pos: Vec<i32> = (0..batch).map(|i| (seq_len - batch + i) as i32).collect();
+            let positions = gpu.upload_f32(&vec![0.0f32; batch], &[batch]).unwrap();
+            let pb: Vec<u8> = pos.iter().flat_map(|v| v.to_ne_bytes()).collect();
+            gpu.hip.memcpy_htod(&positions.buf, &pb).unwrap();
+            let plen = nh * max_seq.div_ceil(tile) * (2 + HEAD_DIM);
+            let partials = gpu.zeros(&[plen], DType::F32).unwrap();
+            let run = |gpu: &mut Gpu| {
+                gpu.attention_flash_fwht3_batched_masked(
+                    &q, &k_cache, &v_cache, &out, &positions, &signs1, &signs2, nh, N_KV_HEADS,
+                    HEAD_DIM, max_seq, seq_len, batch, &partials, None, 0, 0, 8,
+                )
+                .expect("gqa probe");
+            };
+            run(&mut gpu);
+            gpu.hip.device_synchronize().unwrap();
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                run(&mut gpu);
+            }
+            gpu.hip.device_synchronize().unwrap();
+            let ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+            eprintln!(
+                "  GQA probe: n_heads={nh:>2} (ratio {}) -> {ms:.3} ms",
+                nh / N_KV_HEADS
+            );
+        }
+        eprintln!();
+    }
+
     for seq_len in [32_768usize, 124_345] {
         for batch in [8usize, 16, 32, 64, 128] {
             let q_elems = batch * N_HEADS * HEAD_DIM;
